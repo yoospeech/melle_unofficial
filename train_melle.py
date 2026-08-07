@@ -45,7 +45,8 @@ LEARNING_RATE = 5e-5
 MAX_ITERS = 400_000
 WEIGHT_DECAY = 0.1
 WARMUP_ITERS = 2_000
-KL_WARMUP_ITERS = 10_000
+KL_ANNEAL_ITERS = 10_000
+MAX_KL_WEIGHT = 0.1
 MIN_LR = 0.0
 GRAD_CLIP = 1.0
 DEVICE = "cuda"
@@ -215,13 +216,14 @@ def compute_losses(batch, step, sample_latent=True):
         batch["mel_mask"],
         sample_latent=sample_latent,
     )
+    kl_weight = MAX_KL_WEIGHT * min(1.0, step / max(1, KL_ANNEAL_ITERS))
     return melle_loss(
         outputs,
         batch["mel_targets"],
         batch["mel_mask"],
         batch["loss_mask"],
         batch["stop_targets"],
-        kl_weight=0.0 if step < KL_WARMUP_ITERS else 0.1,
+        kl_weight=kl_weight,
     )
 
 

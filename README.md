@@ -205,8 +205,10 @@ is a 24 kHz WAV containing both the prompt and generated continuation.
   slow.
 - Vocos uses natural-log 100-bin features. Their scale differs from the
   paper's 16 kHz, 80-bin, base-10-log features.
-- The spectrogram flux term is an unbounded negative reward. Monitor regression
-  and KL trends alongside the total loss.
+- The original unbounded negative spectrogram-flux reward is implemented as a
+  bounded hinge penalty with a 0.4 frame-level margin, calibrated on the
+  Vocos/LibriTTS features used here. KL weight is linearly annealed from 0 to
+  0.1 over the first 10K updates.
 - Do not use the model to imitate a person's voice without their consent or to
   create misleading content.
 
