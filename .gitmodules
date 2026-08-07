@@ -1,0 +1,3 @@
+[submodule "vocos"]
+	path = vocos
+	url = https://github.com/gemelo-ai/vocos.git

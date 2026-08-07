@@ -1,0 +1,8 @@
+[
+  {
+    "audio_filepath": "/absolute/path/to/audio.wav",
+    "text": "Example transcript.",
+    "speaker": "speaker_id",
+    "duration": 6.0
+  }
+]

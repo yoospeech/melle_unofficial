@@ -1,0 +1,12 @@
+einops
+encodec==0.1.1
+huggingface-hub
+librosa
+numpy
+PyYAML
+scipy
+sentencepiece
+tensorboard
+torch
+torchaudio
+tqdm
