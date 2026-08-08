@@ -162,6 +162,7 @@ bash inference_melle.sh \
   --checkpoint ./runs/melle_.../checkpoints/ckpt.pt \
   --tokenizer ./melle_tokenizer.model \
   --prompt-audio ./reference.wav \
+  --prompt-copy-output ./prompt_copy.wav \
   --text "Nice to meet you." \
   --output ./generated.wav
 ```

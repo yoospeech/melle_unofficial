@@ -19,6 +19,11 @@ def parse_args():
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--tokenizer", default="melle_tokenizer.model")
     parser.add_argument("--prompt-audio", required=True)
+    parser.add_argument(
+        "--prompt-copy-output",
+        default="",
+        help="Optional Vocos copy-synthesis WAV used to verify the prompt feature pipeline",
+    )
     parser.add_argument("--text", required=True, help="Full transcript: prompt plus continuation text")
     parser.add_argument("--output", default="melle_output.wav")
     parser.add_argument("--vocos-repo", default="charactr/vocos-mel-24khz")
@@ -85,6 +90,10 @@ def generate(model, text_ids, prompt, config, args):
     # generation concludes, not at every generation step.
     coarse = known_mel.unsqueeze(0)
     refined = coarse + model.postnet(coarse.to(next(model.parameters()).dtype)).float()
+    # Prompt positions receive no post-net loss during training. Preserve the
+    # ground-truth prompt features instead of applying unconstrained residuals
+    # to them; the post-net only refines autoregressively generated frames.
+    refined[:, :prompt_steps] = coarse[:, :prompt_steps]
     return refined[0], prompt_steps
 
 
@@ -114,8 +123,21 @@ def main():
 
     vocos = Vocos.from_pretrained(args.vocos_repo).to(device).eval()
     prompt = load_prompt(args.prompt_audio, config, vocos.feature_extractor, device)
+    if args.prompt_copy_output:
+        prompt_audio = vocos.decode(prompt.transpose(0, 1).unsqueeze(0)).cpu()
+        torchaudio.save(args.prompt_copy_output, prompt_audio, config.sample_rate)
+        print(f"Saved Vocos prompt copy: {args.prompt_copy_output}")
     with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=device == "cuda"):
         features, prompt_steps = generate(model, text_ids, prompt, config, args)
+    generated_features = features[prompt_steps:]
+    print(
+        "Feature statistics: "
+        f"prompt mean={prompt.mean().item():.3f}, std={prompt.std().item():.3f}; "
+        f"generated mean={generated_features.mean().item():.3f}, "
+        f"std={generated_features.std().item():.3f}, "
+        f"min={generated_features.min().item():.3f}, "
+        f"max={generated_features.max().item():.3f}"
+    )
     audio = vocos.decode(features.transpose(0, 1).unsqueeze(0).to(device)).cpu()
     torchaudio.save(args.output, audio, config.sample_rate)
     print(
