@@ -214,6 +214,7 @@ def compute_losses(batch, step, sample_latent=True):
         batch["text_mask"],
         batch["mel_inputs"],
         batch["mel_mask"],
+        batch["prompt_lengths"],
         sample_latent=sample_latent,
     )
     kl_weight = MAX_KL_WEIGHT * min(1.0, step / max(1, KL_ANNEAL_ITERS))

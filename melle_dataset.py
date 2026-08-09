@@ -214,5 +214,8 @@ def melle_collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Te
         "mel_targets": mel_targets,
         "mel_mask": mel_mask,
         "loss_mask": loss_mask,
+        "prompt_lengths": torch.tensor(
+            [int(item["prompt_length"].item()) for item in batch], dtype=torch.long
+        ),
         "stop_targets": stop_targets,
     }

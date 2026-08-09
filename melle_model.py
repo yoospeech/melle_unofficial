@@ -187,12 +187,39 @@ class MelleModel(nn.Module):
         mel_positions.copy_(all_mel_positions.clamp_max(max_total - 1))
         return packed, mel_positions
 
+    @staticmethod
+    def _prefix_attention_mask(
+        text_lengths: torch.Tensor,
+        mel_lengths: torch.Tensor,
+        prompt_lengths: torch.Tensor,
+        sequence_length: int,
+    ) -> torch.Tensor:
+        """Allow bidirectional text+prompt attention and causal continuation.
+
+        Mel inputs are ``[GO, y0, ..., y(T-2)]``. For a P-frame prompt,
+        ``GO`` plus the P ground-truth prompt frames form the acoustic prefix;
+        the final prefix position predicts the first continuation frame.
+        """
+        total_lengths = text_lengths + mel_lengths
+        prefix_lengths = (text_lengths + prompt_lengths + 1).minimum(total_lengths)
+        positions = torch.arange(sequence_length, device=text_lengths.device)
+        queries = positions.view(1, sequence_length, 1)
+        keys = positions.view(1, 1, sequence_length)
+        valid_queries = queries < total_lengths.view(-1, 1, 1)
+        valid_keys = keys < total_lengths.view(-1, 1, 1)
+        prefix = prefix_lengths.view(-1, 1, 1)
+        prefix_to_prefix = (queries < prefix) & (keys < prefix)
+        continuation_causal = (queries >= prefix) & (keys <= queries)
+        allowed = valid_queries & valid_keys & (prefix_to_prefix | continuation_causal)
+        return allowed.unsqueeze(1)
+
     def forward(
         self,
         text_ids: torch.Tensor,
         text_mask: torch.Tensor,
         mel_inputs: torch.Tensor,
         mel_mask: torch.Tensor,
+        prompt_lengths: torch.Tensor,
         sample_latent: bool = True,
     ) -> Dict[str, torch.Tensor]:
         text_embeddings = self.text_embedding(text_ids)
@@ -205,8 +232,19 @@ class MelleModel(nn.Module):
             text_embeddings, text_mask, mel_embeddings, mel_mask
         )
         seq_len = hidden.size(1)
+        attention_mask = self._prefix_attention_mask(
+            text_mask.sum(dim=1),
+            mel_mask.sum(dim=1),
+            prompt_lengths,
+            seq_len,
+        )
         for layer in self.layers:
-            hidden = layer(hidden, self.freqs_cos[:seq_len], self.freqs_sin[:seq_len])
+            hidden = layer(
+                hidden,
+                self.freqs_cos[:seq_len],
+                self.freqs_sin[:seq_len],
+                attention_mask,
+            )
         hidden = self.norm(hidden)
         mel_hidden = hidden.gather(
             1, mel_positions.unsqueeze(-1).expand(-1, -1, hidden.size(-1))

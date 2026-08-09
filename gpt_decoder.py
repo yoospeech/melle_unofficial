@@ -129,6 +129,7 @@ class Attention(nn.Module):
         x: torch.Tensor,
         freqs_cos: torch.Tensor,
         freqs_sin: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
     ):
         bsz, seqlen, _ = x.shape
 
@@ -152,12 +153,24 @@ class Attention(nn.Module):
 
         # flash implementation
         if self.flash:
-            output = torch.nn.functional.scaled_dot_product_attention(xq, xk, xv, attn_mask=None, dropout_p=self.dropout if self.training else 0.0, is_causal=True)
+            output = torch.nn.functional.scaled_dot_product_attention(
+                xq,
+                xk,
+                xv,
+                attn_mask=attention_mask,
+                dropout_p=self.dropout if self.training else 0.0,
+                is_causal=attention_mask is None,
+            )
         else:
             # manual implementation
             scores = torch.matmul(xq, xk.transpose(2, 3)) / math.sqrt(self.head_dim)
-            assert hasattr(self, 'mask')
-            scores = scores + self.mask[:, :, :seqlen, :seqlen]   # (bs, n_local_heads, seqlen, cache_len + seqlen)
+            if attention_mask is None:
+                assert hasattr(self, 'mask')
+                scores = scores + self.mask[:, :, :seqlen, :seqlen]
+            elif attention_mask.dtype == torch.bool:
+                scores = scores.masked_fill(~attention_mask, float("-inf"))
+            else:
+                scores = scores + attention_mask
             scores = F.softmax(scores.float(), dim=-1).type_as(xq)
             scores = self.attn_dropout(scores)
             output = torch.matmul(scores, xv)  # (bs, n_local_heads, seqlen, head_dim)
@@ -204,8 +217,10 @@ class TransformerBlock(nn.Module):
         self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
 
-    def forward(self, x, freqs_cos, freqs_sin):
-        h = x + self.attention.forward(self.attention_norm(x), freqs_cos, freqs_sin)
+    def forward(self, x, freqs_cos, freqs_sin, attention_mask=None):
+        h = x + self.attention.forward(
+            self.attention_norm(x), freqs_cos, freqs_sin, attention_mask
+        )
         out = h + self.feed_forward.forward(self.ffn_norm(h))
         return out
 

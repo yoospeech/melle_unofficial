@@ -78,6 +78,7 @@ def generate(model, text_ids, prompt, config, args):
             text_mask,
             mel_inputs,
             mel_mask,
+            torch.tensor([prompt_steps], dtype=torch.long, device=device),
             sample_latent=True,
         )
         next_frame = outputs["coarse_mel"][0, -1].float()
