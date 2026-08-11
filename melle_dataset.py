@@ -54,8 +54,8 @@ class MelConfig:
 class MelleDataset(Dataset):
     """Return text tokens and continuous log-mel targets.
 
-    The manifest contract is intentionally the same as ``dataset.py``:
-    ``audio_filepath``, ``text`` and optionally ``duration``.
+    Each manifest item contains ``audio_filepath``, ``text`` and optionally
+    ``duration``.
     """
 
     def __init__(

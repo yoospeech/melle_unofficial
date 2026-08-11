@@ -1,79 +1,65 @@
-# MELLE Unofficial
+<h1 align="center">MELLE Unofficial</h1>
 
-An unofficial PyTorch implementation of MELLE training and inference. A
-decoder-only Transformer autoregressively generates continuous mel-spectrogram
-frames from text, with optional acoustic prompting at inference. Vocos then
-converts the generated features into a 24 kHz waveform.
+<p align="center">
+  <strong>Autoregressive speech synthesis with continuous mel-spectrograms</strong>
+</p>
 
-> This repository is an unofficial implementation intended for research and
-> experimentation. It is not the authors' official code. Some feature and
-> training settings differ from the paper to provide direct Vocos
-> compatibility.
+<p align="center">
+  <a href="https://arxiv.org/abs/2407.08551"><img alt="Paper" src="https://img.shields.io/badge/arXiv-2407.08551-b31b1b.svg"></a>
+  <a href="https://github.com/yoospeech/melle_unofficial"><img alt="GitHub" src="https://img.shields.io/badge/GitHub-melle__unofficial-181717?logo=github"></a>
+  <a href="https://github.com/gemelo-ai/vocos"><img alt="Vocoder" src="https://img.shields.io/badge/Vocoder-Vocos-6f42c1"></a>
+  <img alt="Sample rate" src="https://img.shields.io/badge/Audio-24%20kHz-2ea44f">
+  <img alt="Framework" src="https://img.shields.io/badge/PyTorch-BF16-ee4c2c?logo=pytorch&logoColor=white">
+</p>
 
-## Training structure
+An unofficial PyTorch implementation inspired by
+[MELLE](https://arxiv.org/abs/2407.08551). The model generates continuous
+mel-spectrogram frames autoregressively from text, then converts them to a
+24 kHz waveform with [Vocos](https://github.com/gemelo-ai/vocos). Optional
+reference-audio prompting is supported during inference.
+
+> [!IMPORTANT]
+> This is an independent research implementation, not the authors' official
+> code or an exact reproduction. Its 24 kHz Vocos features differ from the
+> paper's reported mel configuration. The original negative flux objective is
+> also unbounded below; monitor `flux`, `kl`, and total loss during training.
+
+## Overview
 
 ```text
-Full text ─> Prefix-LM Transformer ─> continuous mel ─> Vocos ─> audio
+Text ──> character tokenizer ──> prefix Transformer ──> continuous mel ──> Vocos ──> 24 kHz audio
+                                     │
+                                     └── EOS hidden state predicts the first mel frame
 ```
 
-Each sample is arranged as:
+The training sequence is aligned without a synthetic acoustic `GO` token:
 
 ```text
-[full text][complete causal mel sequence]
+Model sequence   [BOS, text ..., EOS, mel₀, mel₁, ..., melₜ₋₂]
+Acoustic queries [                 EOS, mel₀, mel₁, ..., melₜ₋₂]
+Mel targets      [                  y₀,   y₁,   y₂, ...,   yₜ₋₁]
 ```
 
-| Region | LLM context | Loss |
+| Sequence region | Attention | Training loss |
 | --- | --- | --- |
-| Real text tokens | Included | Excluded |
-| Complete mel sequence | Included causally | Included |
-| Padding | Excluded | Excluded |
+| Valid text tokens | Fully visible text prefix | Excluded |
+| All valid mel frames | Causal over text and earlier mel frames | Included |
+| Padding | Blocked as both key and query | Excluded |
 
-Text tokens form a fully visible prefix. Prompt mel and continuation mel use
-causal attention over the complete text and earlier mel frames. The acoustic
-head uses the text `EOS` hidden state to predict the first mel frame, and every
-mel hidden state predicts the following mel frame, so no synthetic `GO` frame
-is used. Padding is blocked from attention. Regression, KL, flux, and stop
-losses supervise the complete mel target; at inference, supplied leading mel
-frames act as the acoustic prompt.
+## Highlights
 
-```text
-Acoustic query: [EOS, y0, y1, ..., y(T-2)]
-Mel target:     [ y0, y1, y2, ..., y(T-1)]
-```
+- Continuous mel-spectrogram autoregression without acoustic token
+  quantization
+- SentencePiece character tokenizer trained from the supplied manifest
+- 12-layer, 1024-dimensional decoder-only Transformer with 16 attention heads
+- Variational latent sampling, convolutional post-net, and learned stop head
+- Regression, KL, spectrogram-flux, and stop-prediction objectives
+- Direct use of Vocos `MelSpectrogramFeatures` for feature compatibility
+- BF16, fused AdamW, gradient clipping, TensorBoard, tqdm, DDP, and resume
+  support
+- Settings tuned for a single NVIDIA DGX Spark GPU
 
-## Main components
-
-- SentencePiece character text tokenizer
-- 12-layer decoder-only Transformer
-- Model dimension 1024, 16 attention heads, and FFN dimension 4096
-- Variational latent sampling module
-- Coarse and refined mel regression losses
-- KL divergence, spectrogram flux, and stop prediction losses
-- Five-layer convolutional post-net
-- BF16 and fused AdamW on CUDA
-- TensorBoard and tqdm logging
-- DDP and checkpoint resume support
-
-## Vocos features
-
-The dataset directly uses `MelSpectrogramFeatures` from
-[Vocos](https://github.com/gemelo-ai/vocos).
-
-| Setting | Value |
-| --- | ---: |
-| Sampling rate | 24,000 Hz |
-| FFT/window | 1024 |
-| Hop length | 256 |
-| Mel channels | 100 |
-| Padding | center |
-| Magnitude power | 1 |
-| Log transform | Vocos `safe_log` |
-| Frame rate | 93.75 frames/s |
-
-Audio with a different sampling rate is automatically resampled to 24 kHz
-with `torchaudio`.
-
-## Installation
+## Quick start
 
 ```bash
 git clone --recurse-submodules https://github.com/yoospeech/melle_unofficial.git
@@ -82,17 +68,23 @@ cd melle_unofficial
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+
+cp manifest.example.json manifest.json
+# Edit manifest.json so that each audio_filepath points to a real file.
+
+BATCH_SIZE=16 MANIFEST_PATH=manifest.json bash train_melle.sh
 ```
 
-If the repository was cloned without submodules, initialize Vocos separately:
+If the repository was cloned without submodules:
 
 ```bash
 git submodule update --init --recursive
 ```
 
-## Manifest
+## Data
 
-The training manifest is a JSON array:
+The manifest must be a JSON array containing an audio path and transcript for
+each sample:
 
 ```json
 [
@@ -105,16 +97,34 @@ The training manifest is a JSON array:
 ]
 ```
 
-- The default duration range is 4–10 seconds.
-- Training predicts each utterance's complete mel sequence from text.
-- After filtering, 0.1% of the samples are deterministically reserved for
+- Samples are filtered to the default duration range of 4–10 seconds.
+- Audio is resampled to 24 kHz when necessary.
+- Training uses the complete utterance as its mel target; there is no fixed
+  three-second acoustic prompt in the training sample.
+- After filtering, 0.1% of samples are deterministically reserved for
   validation.
-- Manifests and audio files are excluded from Git.
+- `speaker` is accepted as manifest metadata but is not currently passed to a
+  speaker embedding.
+
+## Acoustic features
+
+The dataset imports `MelSpectrogramFeatures` directly from the included Vocos
+submodule.
+
+| Setting | Value |
+| --- | ---: |
+| Sample rate | 24,000 Hz |
+| FFT / window length | 1024 |
+| Hop length | 256 |
+| Mel channels | 100 |
+| Frame rate | 93.75 frames/s |
+| Spectrogram power | 1 |
+| Padding | Centered |
+| Compression | Vocos natural-log `safe_log` |
 
 ## Training
 
-The following command starts training with a batch size of 16 on a single
-NVIDIA DGX Spark GPU:
+Start a single-GPU run:
 
 ```bash
 BATCH_SIZE=16 \
@@ -124,11 +134,21 @@ CUDA_VISIBLE_DEVICES=0 \
 bash train_melle.sh
 ```
 
-`BATCH_SIZE` is the number of utterances per batch. Reduce it to 8 if memory is
-insufficient, or increase it to 32 if enough memory is available.
+The character tokenizer is created automatically from the manifest when the
+specified model does not exist. `BATCH_SIZE` is the number of utterances per
+GPU step; use 8 if memory is tight, or increase it only after measuring memory
+usage.
 
-On the first run, a SentencePiece character tokenizer is trained automatically
-from the text in the manifest. Runs are stored as:
+| Environment variable | Default | Purpose |
+| --- | --- | --- |
+| `MANIFEST_PATH` | `manifest.json` | Training manifest |
+| `TOKENIZER_PATH` | `melle_character_tokenizer.model` | Tokenizer model |
+| `BATCH_SIZE` | `16` | Utterances per GPU batch |
+| `RESUME_CKPT` | empty | Checkpoint from which to resume |
+
+Default optimization settings include a `5e-5` learning rate, 2,000 warmup
+steps, 400,000 maximum steps, and KL annealing to `0.1` over the first 10,000
+updates. Runs are written to:
 
 ```text
 runs/melle_YYYY_MM_DD_HH_MM_SS/
@@ -137,13 +157,13 @@ runs/melle_YYYY_MM_DD_HH_MM_SS/
     └── ckpt.pt
 ```
 
-Start TensorBoard with:
+Monitor a run with TensorBoard:
 
 ```bash
 tensorboard --logdir runs --bind_all
 ```
 
-Resume training with:
+Resume from a checkpoint:
 
 ```bash
 BATCH_SIZE=16 \
@@ -155,10 +175,10 @@ bash train_melle.sh
 
 ## Inference
 
-Inference can synthesize directly from text, matching full-mel training, or
-optionally condition on a reference audio prompt.
+### Text only
 
-Text-only synthesis starts from the text `EOS` hidden state:
+Text-only synthesis starts generation from the text `EOS` hidden state, which
+matches the first-frame prediction used during training.
 
 ```bash
 bash inference_melle.sh \
@@ -168,8 +188,11 @@ bash inference_melle.sh \
   --output ./generated.wav
 ```
 
-For prompted synthesis, pass the prompt transcript and target content together
-through `--text`:
+### Optional acoustic prompt
+
+Pass a reference waveform to condition generation on its leading mel frames.
+The text must contain the linguistic context you want the model to condition
+on, including the prompt transcript when prompted continuation is intended.
 
 ```bash
 bash inference_melle.sh \
@@ -177,58 +200,66 @@ bash inference_melle.sh \
   --tokenizer ./melle_character_tokenizer.model \
   --prompt-audio ./reference.wav \
   --prompt-copy-output ./prompt_copy.wav \
-  --text "Nice to meet you." \
-  --output ./generated.wav
-```
-
-Generation limits and the stop threshold can also be configured:
-
-```bash
-bash inference_melle.sh \
-  --checkpoint ./runs/melle_.../checkpoints/ckpt.pt \
-  --prompt-audio ./reference.wav \
-  --text "Nice to meet you." \
+  --text "Prompt transcript. Target sentence." \
   --output ./generated.wav \
-  --min-new-seconds 0.5 \
-  --max-new-seconds 5.0 \
-  --stop-threshold 0.5 \
-  --seed 1337
+  --max-new-seconds 5
 ```
 
-The default vocoder is the official `charactr/vocos-mel-24khz` checkpoint,
-which is downloaded automatically during the first inference run. The output
-is a 24 kHz WAV containing both the prompt and generated continuation.
+Useful generation controls include `--min-new-seconds`,
+`--max-new-seconds`, `--stop-threshold`, and `--seed`. The default decoder is
+the `charactr/vocos-mel-24khz` checkpoint, downloaded on its first use.
 
 ## Repository layout
 
-| Path | Purpose |
-| --- | --- |
-| `melle_dataset.py` | 24 kHz audio processing, Vocos features, and prompt/loss masks |
-| `melle_tokenizer.py` | SentencePiece character tokenizer |
-| `melle_model.py` | Transformer, latent sampler, stop head, and post-net |
-| `melle_loss.py` | Regression, KL, flux, and stop losses |
-| `train_melle.py` | Training, validation, DDP, logging, and checkpoints |
-| `inference_melle.py` | Autoregressive mel generation and Vocos decoding |
-| `train_melle.sh` | DGX Spark training environment |
-| `inference_melle.sh` | Inference environment |
-| `vocos/` | Vocos Git submodule |
-| `dataset.py`, `train.py` | Legacy WavTokenizer discrete-token experiments |
+```text
+.
+├── melle_dataset.py       # Audio loading, Vocos features, collation, masks
+├── melle_tokenizer.py     # SentencePiece character tokenizer
+├── melle_model.py         # Transformer, latent sampler, post-net, stop head
+├── melle_loss.py          # Regression, KL, flux, and stop objectives
+├── train_melle.py         # Training, validation, DDP, logs, checkpoints
+├── inference_melle.py     # Autoregressive generation and Vocos decoding
+├── train_melle.sh         # DGX Spark training launcher
+├── inference_melle.sh     # Inference launcher
+├── manifest.example.json  # Minimal manifest template
+└── vocos/                 # Vocos Git submodule
+```
 
-## Notes and limitations
+## Current limitations
 
-- AR inference does not currently use a KV cache, so long generations can be
-  slow.
-- Vocos uses natural-log 100-bin features. Their scale differs from the
-  paper's 16 kHz, 80-bin, base-10-log features.
-- The original negative spectrogram-flux reward is used. Because it is
-  unbounded below, monitor its magnitude carefully with the 24 kHz Vocos
-  feature scale. KL weight is linearly annealed from 0 to 0.1 over the first
-  10K updates.
-- Do not use the model to imitate a person's voice without their consent or to
-  create misleading content.
+- Autoregressive inference does not use a KV cache, so long generation is
+  computationally expensive.
+- Prompted inference is available, but training currently predicts complete
+  utterances from text without a separate acoustic-prompt split.
+- The Vocos feature scale differs from the paper's reported 16 kHz, 80-bin,
+  base-10-log configuration.
+- No pretrained MELLE checkpoint is distributed by this repository.
 
-## References
+## Responsible use
 
-- [MELLE: Autoregressive Speech Synthesis without Vector Quantization](https://arxiv.org/abs/2407.08551)
-- [Vocos: Closing the Gap Between Time-Domain and Fourier-Based Neural Vocoders](https://github.com/gemelo-ai/vocos)
-- [WavTokenizer](https://github.com/jishengpeng/WavTokenizer)
+Use only audio and voices for which you have the necessary rights and consent.
+Do not use generated speech for impersonation, deception, or misleading
+content.
+
+## Acknowledgements
+
+- [MELLE](https://arxiv.org/abs/2407.08551) for the continuous
+  mel-spectrogram language-modeling formulation
+- [Vocos](https://github.com/gemelo-ai/vocos) for acoustic feature extraction
+  and waveform decoding
+Vocos is included as a Git submodule under its own MIT license. Review the
+licenses of all dependencies and datasets before redistribution.
+
+## Citation
+
+If this repository is useful in your work, please cite the original MELLE
+paper:
+
+```bibtex
+@article{meng2024melle,
+  title   = {Autoregressive Speech Synthesis without Vector Quantization},
+  author  = {Meng, Lingwei and Zhou, Long and Liu, Shujie and Chen, Sanyuan and Han, Bing and Hu, Shujie and Liu, Yanqing and Li, Jinyu and Zhao, Sheng and Wu, Xixin and Meng, Helen and Wei, Furu},
+  journal = {arXiv preprint arXiv:2407.08551},
+  year    = {2024}
+}
+```
