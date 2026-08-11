@@ -19,13 +19,13 @@ from tqdm.auto import tqdm
 from melle_dataset import MelConfig, MelleDataset, melle_collate_fn
 from melle_loss import melle_loss
 from melle_model import MelleModel, MelleModelArgs
-from melle_tokenizer import MelleBPETokenizer
+from melle_tokenizer import MelleCharacterTokenizer
 
 
 MANIFEST_PATH = os.environ.get("MANIFEST_PATH", "manifest.json")
-TOKENIZER_PATH = os.environ.get("TOKENIZER_PATH", "melle_tokenizer.model")
+TOKENIZER_PATH = os.environ.get("TOKENIZER_PATH", "melle_character_tokenizer.model")
 RESUME_CKPT = os.environ.get("RESUME_CKPT", "")
-LOG_INTERVAL = 100
+LOG_INTERVAL = 5
 EVAL_INTERVAL = 500
 EVAL_ITERS = 50
 SAVE_CKPT = True
@@ -96,7 +96,9 @@ scaler = torch.cuda.amp.GradScaler(enabled=(device != "cpu" and DTYPE == "float1
 # Avoid concurrent SentencePiece writes when launching with torchrun.
 if ddp and not os.path.exists(TOKENIZER_PATH):
     if master_process:
-        MelleBPETokenizer(TOKENIZER_PATH, vocab_size=4000).load_or_train(MANIFEST_PATH)
+        MelleCharacterTokenizer(TOKENIZER_PATH, vocab_size=4000).load_or_train(
+            MANIFEST_PATH
+        )
     dist.barrier()
 
 mel_config = MelConfig(reduction_factor=REDUCTION_FACTOR)
@@ -113,8 +115,7 @@ if len(full_dataset) < 2:
 if master_process:
     print(
         f"Duration filter: {MIN_DURATION_SEC:.1f}s to {MAX_DURATION_SEC:.1f}s; "
-        f"fixed prompt={mel_config.prompt_duration_sec:.1f}s "
-        f"({mel_config.prompt_steps} mel frames)"
+        "training predicts the complete mel target from text"
     )
 
 val_size = max(1, round(len(full_dataset) * VAL_RATIO))
@@ -213,15 +214,14 @@ def compute_losses(batch, step, sample_latent=True):
         batch["text_ids"],
         batch["text_mask"],
         batch["mel_inputs"],
-        batch["mel_mask"],
-        batch["prompt_lengths"],
+        batch["mel_input_mask"],
         sample_latent=sample_latent,
     )
     kl_weight = MAX_KL_WEIGHT * min(1.0, step / max(1, KL_ANNEAL_ITERS))
     return melle_loss(
         outputs,
         batch["mel_targets"],
-        batch["mel_mask"],
+        batch["mel_target_mask"],
         batch["loss_mask"],
         batch["stop_targets"],
         kl_weight=kl_weight,

@@ -24,7 +24,6 @@ def melle_loss(
     stop_targets: torch.Tensor,
     kl_weight: float,
     flux_weight: float = 0.5,
-    flux_margin: float = 0.4,
     stop_weight: float = 1.0,
     stop_positive_weight: float = 100.0,
 ) -> Dict[str, torch.Tensor]:
@@ -42,18 +41,13 @@ def melle_loss(
     kl_values = 0.5 * (logvar.exp() + (mu - targets).square() - 1.0 - logvar)
     kl = _masked_mean(kl_values, loss_mask)
 
-    # The first continuation frame is compared with the final prompt frame.
-    # MELLE's original negative flux reward is unbounded below. A hinge keeps
-    # the same intent (discourage static predictions) without rewarding
-    # arbitrarily large means. A margin of 0.4 matches the median frame-level
-    # L1 change measured on this repository's Vocos/LibriTTS features.
+    # Equation (9) of MELLE: reward variation between the predicted Gaussian
+    # mean and the preceding ground-truth frame. The first continuation frame
+    # is compared with the final prompt frame.
     flux_mask = loss_mask[:, 1:] & mel_mask[:, :-1]
     if targets.size(1) > 1 and flux_mask.any():
         frame_flux = (mu[:, 1:] - targets[:, :-1]).abs().mean(dim=-1)
-        flux = _masked_mean(
-            F.relu(flux_margin - frame_flux),
-            flux_mask,
-        )
+        flux = -_masked_mean(frame_flux, flux_mask)
     else:
         flux = mu.sum() * 0.0
 

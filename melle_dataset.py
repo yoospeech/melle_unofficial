@@ -14,7 +14,7 @@ import torch
 import torchaudio
 from torch.utils.data import Dataset
 
-from melle_tokenizer import MelleBPETokenizer
+from melle_tokenizer import MelleCharacterTokenizer
 
 # The repository vendors Vocos as a standalone Python project under ./vocos.
 # Put that project root first so its canonical ``vocos.*`` imports resolve in
@@ -61,7 +61,7 @@ class MelleDataset(Dataset):
     def __init__(
         self,
         manifest_path: str,
-        tokenizer_path: str = "melle_tokenizer.model",
+        tokenizer_path: str = "melle_character_tokenizer.model",
         mel_config: MelConfig = MelConfig(),
         max_seq_len: int = 2048,
         max_duration_sec: Optional[float] = 10.0,
@@ -83,18 +83,13 @@ class MelleDataset(Dataset):
             records = json.load(handle)
         if not isinstance(records, list):
             raise ValueError("manifest must contain a JSON array")
-        minimum_continuation_duration = (
-            mel_config.prompt_duration_sec
-            + mel_config.hop_length / mel_config.sample_rate
-        )
-        effective_min_duration = max(min_duration_sec, minimum_continuation_duration)
         self.data = self._filter_records(
             records,
-            min_duration_sec=effective_min_duration,
+            min_duration_sec=min_duration_sec,
             max_duration_sec=max_duration_sec,
         )
 
-        self.tokenizer = MelleBPETokenizer(tokenizer_path, vocab_size=4000)
+        self.tokenizer = MelleCharacterTokenizer(tokenizer_path, vocab_size=4000)
         self.tokenizer.load_or_train(manifest_path)
 
     @staticmethod
@@ -160,18 +155,9 @@ class MelleDataset(Dataset):
                 f"within max_seq_len={self.max_seq_len}"
             )
         mel = mel[:max_mel_len]
-        prompt_length = self.mel_config.prompt_steps
-        if mel.size(0) <= prompt_length:
-            raise ValueError(
-                f"audio must contain more than the fixed "
-                f"{self.mel_config.prompt_duration_sec:.1f}s prompt: "
-                f"{item['audio_filepath']} produced {mel.size(0)} mel frames, "
-                f"but prompt requires {prompt_length}"
-            )
         return {
             "text_ids": text,
             "mel_targets": mel,
-            "prompt_length": torch.tensor(prompt_length, dtype=torch.long),
         }
 
 
@@ -180,16 +166,20 @@ def melle_collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Te
         raise ValueError("cannot collate an empty batch")
     batch_size = len(batch)
     max_text = max(item["text_ids"].numel() for item in batch)
-    max_mel = max(item["mel_targets"].size(0) for item in batch)
+    # EOS predicts y[0], and each input mel y[t] predicts y[t+1]. No synthetic
+    # acoustic GO frame is needed.
+    max_mel_target = max(item["mel_targets"].size(0) for item in batch)
+    max_mel_input = max_mel_target - 1
     feature_dim = batch[0]["mel_targets"].size(1)
 
     text_ids = torch.zeros(batch_size, max_text, dtype=torch.long)
     text_mask = torch.zeros(batch_size, max_text, dtype=torch.bool)
-    mel_inputs = torch.zeros(batch_size, max_mel, feature_dim)
-    mel_targets = torch.zeros_like(mel_inputs)
-    mel_mask = torch.zeros(batch_size, max_mel, dtype=torch.bool)
-    loss_mask = torch.zeros(batch_size, max_mel, dtype=torch.bool)
-    stop_targets = torch.zeros(batch_size, max_mel)
+    mel_inputs = torch.zeros(batch_size, max_mel_input, feature_dim)
+    mel_targets = torch.zeros(batch_size, max_mel_target, feature_dim)
+    mel_input_mask = torch.zeros(batch_size, max_mel_input, dtype=torch.bool)
+    mel_target_mask = torch.zeros(batch_size, max_mel_target, dtype=torch.bool)
+    loss_mask = torch.zeros(batch_size, max_mel_target, dtype=torch.bool)
+    stop_targets = torch.zeros(batch_size, max_mel_target)
 
     for row, item in enumerate(batch):
         text = item["text_ids"]
@@ -197,14 +187,17 @@ def melle_collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Te
         if mel.size(1) != feature_dim:
             raise ValueError("all mel targets must have the same feature dimension")
         text_len, mel_len = text.numel(), mel.size(0)
-        prompt_len = int(item["prompt_length"].item())
+        prediction_len = mel_len - 1
         text_ids[row, :text_len] = text
         text_mask[row, :text_len] = True
+        mel_inputs[row, :prediction_len] = mel[:-1]
         mel_targets[row, :mel_len] = mel
-        mel_mask[row, :mel_len] = True
-        loss_mask[row, prompt_len:mel_len] = True
-        if mel_len > 1:
-            mel_inputs[row, 1:mel_len] = mel[:-1]
+        mel_input_mask[row, :prediction_len] = True
+        mel_target_mask[row, :mel_len] = True
+        # EOS predicts y[0], and every ground-truth mel frame is supervised.
+        # The leading acoustic frames still serve as the inference prompt, but
+        # training follows p(y|x) over the complete mel target.
+        loss_mask[row, :mel_len] = True
         stop_targets[row, mel_len - 1] = 1.0
 
     return {
@@ -212,10 +205,8 @@ def melle_collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Te
         "text_mask": text_mask,
         "mel_inputs": mel_inputs,
         "mel_targets": mel_targets,
-        "mel_mask": mel_mask,
+        "mel_input_mask": mel_input_mask,
+        "mel_target_mask": mel_target_mask,
         "loss_mask": loss_mask,
-        "prompt_lengths": torch.tensor(
-            [int(item["prompt_length"].item()) for item in batch], dtype=torch.long
-        ),
         "stop_targets": stop_targets,
     }

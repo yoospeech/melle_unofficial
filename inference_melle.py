@@ -10,21 +10,29 @@ import torchaudio
 
 from melle_dataset import MelConfig
 from melle_model import MelleModel, MelleModelArgs
-from melle_tokenizer import MelleBPETokenizer
+from melle_tokenizer import MelleCharacterTokenizer
 from vocos.pretrained import Vocos
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", required=True)
-    parser.add_argument("--tokenizer", default="melle_tokenizer.model")
-    parser.add_argument("--prompt-audio", required=True)
+    parser.add_argument("--tokenizer", default="melle_character_tokenizer.model")
+    parser.add_argument(
+        "--prompt-audio",
+        default="",
+        help="Optional reference audio; omit it to synthesize directly from text",
+    )
     parser.add_argument(
         "--prompt-copy-output",
         default="",
         help="Optional Vocos copy-synthesis WAV used to verify the prompt feature pipeline",
     )
-    parser.add_argument("--text", required=True, help="Full transcript: prompt plus continuation text")
+    parser.add_argument(
+        "--text",
+        required=True,
+        help="Target text, or prompt transcript plus target text when prompt audio is supplied",
+    )
     parser.add_argument("--output", default="melle_output.wav")
     parser.add_argument("--vocos-repo", default="charactr/vocos-mel-24khz")
     parser.add_argument("--max-new-seconds", type=float, default=10.0)
@@ -58,7 +66,8 @@ def generate(model, text_ids, prompt, config, args):
     prompt_steps = prompt.size(0)
     min_steps = max(1, round(args.min_new_seconds * config.sample_rate / config.hop_length))
     max_steps = max(min_steps, round(args.max_new_seconds * config.sample_rate / config.hop_length))
-    available_steps = model.args.max_seq_len - text_ids.size(1) - prompt_steps - 1
+    # A full-length final context can still predict one additional frame.
+    available_steps = model.args.max_seq_len - text_ids.size(1) - prompt_steps + 1
     if available_steps < min_steps:
         raise ValueError(
             "text and prompt leave insufficient model context for the requested "
@@ -67,9 +76,9 @@ def generate(model, text_ids, prompt, config, args):
     max_steps = min(max_steps, available_steps)
 
     for step in range(max_steps):
-        # Training predicts y[t] from [GO, y[0], ..., y[t-1]].
-        go_frame = known_mel.new_zeros(1, known_mel.size(1))
-        mel_inputs = torch.cat([go_frame, known_mel], dim=0).unsqueeze(0)
+        # Training predicts y[t] from y[t-1]. The supplied acoustic prompt
+        # provides the initial context, so inference needs no synthetic GO.
+        mel_inputs = known_mel.unsqueeze(0)
         mel_mask = torch.ones(
             1, mel_inputs.size(1), dtype=torch.bool, device=device
         )
@@ -78,7 +87,6 @@ def generate(model, text_ids, prompt, config, args):
             text_mask,
             mel_inputs,
             mel_mask,
-            torch.tensor([prompt_steps], dtype=torch.long, device=device),
             sample_latent=True,
         )
         next_frame = outputs["coarse_mel"][0, -1].float()
@@ -91,9 +99,9 @@ def generate(model, text_ids, prompt, config, args):
     # generation concludes, not at every generation step.
     coarse = known_mel.unsqueeze(0)
     refined = coarse + model.postnet(coarse.to(next(model.parameters()).dtype)).float()
-    # Prompt positions receive no post-net loss during training. Preserve the
-    # ground-truth prompt features instead of applying unconstrained residuals
-    # to them; the post-net only refines autoregressively generated frames.
+    # The supplied prompt is already ground-truth Vocos feature context.
+    # Preserve it exactly and apply post-net refinement only to generated
+    # frames in the returned prompt-plus-continuation sequence.
     refined[:, :prompt_steps] = coarse[:, :prompt_steps]
     return refined[0], prompt_steps
 
@@ -114,7 +122,7 @@ def main():
     model.load_state_dict(checkpoint["model"])
     model.to(device=device, dtype=torch.bfloat16 if device == "cuda" else torch.float32).eval()
 
-    tokenizer = MelleBPETokenizer(args.tokenizer)
+    tokenizer = MelleCharacterTokenizer(args.tokenizer)
     if not tokenizer.processor.load(args.tokenizer):
         raise ValueError(f"failed to load tokenizer: {args.tokenizer}")
     token_values = [tokenizer.bos_token_id]
@@ -123,7 +131,17 @@ def main():
     text_ids = torch.tensor(token_values, dtype=torch.long)
 
     vocos = Vocos.from_pretrained(args.vocos_repo).to(device).eval()
-    prompt = load_prompt(args.prompt_audio, config, vocos.feature_extractor, device)
+    if args.prompt_audio:
+        prompt = load_prompt(args.prompt_audio, config, vocos.feature_extractor, device)
+    else:
+        prompt = torch.empty(
+            0,
+            model_args.mel_dim,
+            device=device,
+            dtype=torch.float32,
+        )
+    if args.prompt_copy_output and not args.prompt_audio:
+        raise ValueError("--prompt-copy-output requires --prompt-audio")
     if args.prompt_copy_output:
         prompt_audio = vocos.decode(prompt.transpose(0, 1).unsqueeze(0)).cpu()
         torchaudio.save(args.prompt_copy_output, prompt_audio, config.sample_rate)
@@ -131,9 +149,14 @@ def main():
     with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=device == "cuda"):
         features, prompt_steps = generate(model, text_ids, prompt, config, args)
     generated_features = features[prompt_steps:]
+    prompt_stats = (
+        f"prompt mean={prompt.mean().item():.3f}, std={prompt.std().item():.3f}; "
+        if prompt_steps
+        else "prompt=none; "
+    )
     print(
         "Feature statistics: "
-        f"prompt mean={prompt.mean().item():.3f}, std={prompt.std().item():.3f}; "
+        f"{prompt_stats}"
         f"generated mean={generated_features.mean().item():.3f}, "
         f"std={generated_features.std().item():.3f}, "
         f"min={generated_features.min().item():.3f}, "

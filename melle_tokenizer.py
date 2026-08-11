@@ -1,4 +1,4 @@
-"""SentencePiece BPE tokenizer used by the full MELLE configuration."""
+"""SentencePiece character tokenizer used by MELLE."""
 
 from __future__ import annotations
 
@@ -8,8 +8,12 @@ import os
 import sentencepiece as spm
 
 
-class MelleBPETokenizer:
-    def __init__(self, model_path: str = "melle_tokenizer.model", vocab_size: int = 4000):
+class MelleCharacterTokenizer:
+    def __init__(
+        self,
+        model_path: str = "melle_character_tokenizer.model",
+        vocab_size: int = 4000,
+    ):
         self.model_path = model_path
         self.requested_vocab_size = vocab_size
         self.processor = spm.SentencePieceProcessor()
@@ -26,7 +30,10 @@ class MelleBPETokenizer:
             spm.SentencePieceTrainer.train(
                 sentence_iterator=texts,
                 model_prefix=model_prefix,
-                model_type="bpe",
+                # SentencePiece keeps whitespace and Unicode normalization
+                # consistent between training and inference while emitting
+                # character-level pieces rather than learned BPE subwords.
+                model_type="char",
                 vocab_size=self.requested_vocab_size,
                 character_coverage=1.0,
                 pad_id=0,
@@ -52,3 +59,8 @@ class MelleBPETokenizer:
     @property
     def eos_token_id(self) -> int:
         return self.processor.eos_id()
+
+
+# Compatibility for external imports. New MELLE code uses the accurately
+# named character-tokenizer class above.
+MelleBPETokenizer = MelleCharacterTokenizer

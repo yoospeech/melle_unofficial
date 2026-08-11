@@ -20,3 +20,5 @@ manifest.json
 *_manifest_*.json
 melle_tokenizer.model
 melle_tokenizer.vocab
+melle_character_tokenizer.model
+melle_character_tokenizer.vocab

@@ -159,7 +159,7 @@ class MelleModel(nn.Module):
         text_mask: torch.Tensor,
         mel_embeddings: torch.Tensor,
         mel_mask: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_size = text_embeddings.size(0)
         text_lengths = text_mask.sum(dim=1)
         mel_lengths = mel_mask.sum(dim=1)
@@ -170,8 +170,13 @@ class MelleModel(nn.Module):
                 f"packed sequence length {max_total} exceeds max_seq_len={self.args.max_seq_len}"
             )
         packed = text_embeddings.new_zeros(batch_size, max_total, self.args.dim)
-        mel_positions = torch.zeros(
-            batch_size, mel_embeddings.size(1), dtype=torch.long, device=packed.device
+        # Acoustic predictions are aligned as
+        # [EOS hidden, y[0] hidden, ..., y[T-2] hidden] -> [y[0], ..., y[T-1]].
+        acoustic_positions = torch.zeros(
+            batch_size,
+            mel_embeddings.size(1) + 1,
+            dtype=torch.long,
+            device=packed.device,
         )
         text_rows, text_columns = text_mask.nonzero(as_tuple=True)
         packed[text_rows, text_columns] = text_embeddings[text_rows, text_columns]
@@ -179,38 +184,44 @@ class MelleModel(nn.Module):
         mel_rows, mel_columns = mel_mask.nonzero(as_tuple=True)
         mel_destinations = text_lengths[mel_rows] + mel_columns
         packed[mel_rows, mel_destinations] = mel_embeddings[mel_rows, mel_columns]
-        all_mel_positions = text_lengths.unsqueeze(1) + torch.arange(
-            mel_embeddings.size(1), device=packed.device
-        ).unsqueeze(0)
-        # Padded positions are masked from every loss, but gather still requires
-        # their placeholder indices to lie inside the packed tensor.
-        mel_positions.copy_(all_mel_positions.clamp_max(max_total - 1))
-        return packed, mel_positions
+        eos_positions = text_lengths - 1
+        acoustic_positions[:, 0] = eos_positions
+        if mel_embeddings.size(1) > 0:
+            all_mel_positions = text_lengths.unsqueeze(1) + torch.arange(
+                mel_embeddings.size(1), device=packed.device
+            ).unsqueeze(0)
+            # Padded positions are masked from every loss, but gather still
+            # requires placeholder indices to lie inside the packed tensor.
+            acoustic_positions[:, 1:] = all_mel_positions.clamp_max(max_total - 1)
+        acoustic_lengths = mel_lengths + 1
+        acoustic_mask = torch.arange(
+            mel_embeddings.size(1) + 1, device=packed.device
+        ).unsqueeze(0) < acoustic_lengths.unsqueeze(1)
+        return packed, acoustic_positions, acoustic_mask
 
     @staticmethod
-    def _prefix_attention_mask(
+    def _text_prefix_attention_mask(
         text_lengths: torch.Tensor,
         mel_lengths: torch.Tensor,
-        prompt_lengths: torch.Tensor,
         sequence_length: int,
     ) -> torch.Tensor:
-        """Allow bidirectional text+prompt attention and causal continuation.
+        """Allow bidirectional text attention and causal attention over all mel.
 
-        Mel inputs are ``[GO, y0, ..., y(T-2)]``. For a P-frame prompt,
-        ``GO`` plus the P ground-truth prompt frames form the acoustic prefix;
-        the final prefix position predicts the first continuation frame.
+        The factorization is ``p(y_t | x, y_<t)``: the complete text ``x`` is
+        visible as a fixed prefix, while all mel frames belong to the
+        autoregressive ``y`` sequence. Acoustic prompting is an inference
+        operation; training predicts the complete mel target.
         """
         total_lengths = text_lengths + mel_lengths
-        prefix_lengths = (text_lengths + prompt_lengths + 1).minimum(total_lengths)
         positions = torch.arange(sequence_length, device=text_lengths.device)
         queries = positions.view(1, sequence_length, 1)
         keys = positions.view(1, 1, sequence_length)
         valid_queries = queries < total_lengths.view(-1, 1, 1)
         valid_keys = keys < total_lengths.view(-1, 1, 1)
-        prefix = prefix_lengths.view(-1, 1, 1)
+        prefix = text_lengths.view(-1, 1, 1)
         prefix_to_prefix = (queries < prefix) & (keys < prefix)
-        continuation_causal = (queries >= prefix) & (keys <= queries)
-        allowed = valid_queries & valid_keys & (prefix_to_prefix | continuation_causal)
+        mel_causal = (queries >= prefix) & (keys <= queries)
+        allowed = valid_queries & valid_keys & (prefix_to_prefix | mel_causal)
         return allowed.unsqueeze(1)
 
     def forward(
@@ -219,7 +230,6 @@ class MelleModel(nn.Module):
         text_mask: torch.Tensor,
         mel_inputs: torch.Tensor,
         mel_mask: torch.Tensor,
-        prompt_lengths: torch.Tensor,
         sample_latent: bool = True,
     ) -> Dict[str, torch.Tensor]:
         text_embeddings = self.text_embedding(text_ids)
@@ -228,14 +238,13 @@ class MelleModel(nn.Module):
         # BF16/FP16. Packing uses indexed assignment, which requires an exact
         # dtype match between both modality embeddings.
         text_embeddings = text_embeddings.to(dtype=mel_embeddings.dtype)
-        hidden, mel_positions = self._pack_inputs(
+        hidden, acoustic_positions, acoustic_mask = self._pack_inputs(
             text_embeddings, text_mask, mel_embeddings, mel_mask
         )
         seq_len = hidden.size(1)
-        attention_mask = self._prefix_attention_mask(
+        attention_mask = self._text_prefix_attention_mask(
             text_mask.sum(dim=1),
             mel_mask.sum(dim=1),
-            prompt_lengths,
             seq_len,
         )
         for layer in self.layers:
@@ -247,7 +256,7 @@ class MelleModel(nn.Module):
             )
         hidden = self.norm(hidden)
         mel_hidden = hidden.gather(
-            1, mel_positions.unsqueeze(-1).expand(-1, -1, hidden.size(-1))
+            1, acoustic_positions.unsqueeze(-1).expand(-1, -1, hidden.size(-1))
         )
 
         mu, logvar = self.latent_stats(mel_hidden).chunk(2, dim=-1)
@@ -260,9 +269,9 @@ class MelleModel(nn.Module):
         # Values gathered for padded mel positions are placeholders. Zero them
         # before the convolutional post-net so they cannot leak into the final
         # valid frames through the convolution kernel.
-        coarse = coarse * mel_mask.unsqueeze(-1).to(coarse.dtype)
+        coarse = coarse * acoustic_mask.unsqueeze(-1).to(coarse.dtype)
         refined = coarse + self.postnet(coarse)
-        refined = refined * mel_mask.unsqueeze(-1).to(refined.dtype)
+        refined = refined * acoustic_mask.unsqueeze(-1).to(refined.dtype)
         return {
             "coarse_mel": coarse,
             "refined_mel": refined,
