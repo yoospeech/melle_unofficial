@@ -35,9 +35,10 @@ Text ──> character tokenizer ──> prefix Transformer ──> continuous m
 The training sequence is aligned without a synthetic acoustic `GO` token:
 
 ```text
-Model sequence   [BOS, text ..., EOS, mel₀, mel₁, ..., melₜ₋₂]
+Full sequence    [BOS, text ..., EOS, mel₀, mel₁, ..., melₜ₋₂, melₜ₋₁]
+Decoder input    [BOS, text ..., EOS, mel₀, mel₁, ..., melₜ₋₂]
 Acoustic queries [                 EOS, mel₀, mel₁, ..., melₜ₋₂]
-Mel targets      [                  y₀,   y₁,   y₂, ...,   yₜ₋₁]
+Mel targets      [                mel₀, mel₁, mel₂, ..., melₜ₋₁]
 ```
 
 | Sequence region | Attention | Training loss |
