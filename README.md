@@ -53,7 +53,8 @@ Mel targets      [                mel₀, mel₁, mel₂, ..., melₜ₋₁]
   quantization
 - SentencePiece character tokenizer trained from the supplied manifest
 - 12-layer, 1024-dimensional decoder-only Transformer with 16 attention heads
-- Variational latent sampling, convolutional post-net, and learned stop head
+- Variational latent sampling, causal convolutional post-net, and learned stop
+  head
 - Regression, KL, spectrogram-flux, and stop-prediction objectives
 - Direct use of Vocos `MelSpectrogramFeatures` for feature compatibility
 - BF16, fused AdamW, gradient clipping, TensorBoard, tqdm, DDP, and resume
@@ -232,6 +233,10 @@ the `charactr/vocos-mel-24khz` checkpoint, downloaded on its first use.
   computationally expensive.
 - Prompted inference is available, but training currently predicts complete
   utterances from text without a separate acoustic-prompt split.
+- The post-net uses causal left padding so its refined loss remains
+  autoregressively consistent while training the coarse predictor end-to-end;
+  the paper specifies five convolutional blocks with kernel size 5 but does
+  not state its padding convention.
 - The Vocos feature scale differs from the paper's reported 16 kHz, 80-bin,
   base-10-log configuration.
 - No pretrained MELLE checkpoint is distributed by this repository.

@@ -37,7 +37,7 @@ def parse_args():
     parser.add_argument("--vocos-repo", default="charactr/vocos-mel-24khz")
     parser.add_argument("--max-new-seconds", type=float, default=10.0)
     parser.add_argument("--min-new-seconds", type=float, default=0.25)
-    parser.add_argument("--stop-threshold", type=float, default=0.5)
+    parser.add_argument("--stop-threshold", type=float, default=0.7)
     parser.add_argument("--seed", type=int, default=1337)
     return parser.parse_args()
 
@@ -88,6 +88,7 @@ def generate(model, text_ids, prompt, config, args):
             mel_inputs,
             mel_mask,
             sample_latent=True,
+            apply_postnet=False,
         )
         next_frame = outputs["coarse_mel"][0, -1].float()
         stop_probability = outputs["stop_logits"][0, -1].float().sigmoid().item()
@@ -95,10 +96,10 @@ def generate(model, text_ids, prompt, config, args):
         if step + 1 >= min_steps and stop_probability >= args.stop_threshold:
             break
 
-    # The paper applies the non-causal convolutional post-net after AR
-    # generation concludes, not at every generation step.
+    # Apply the causal post-net once after coarse AR generation concludes.
     coarse = known_mel.unsqueeze(0)
-    refined = coarse + model.postnet(coarse.to(next(model.parameters()).dtype)).float()
+    model_dtype = next(model.parameters()).dtype
+    refined = model.refine_mel(coarse.to(model_dtype)).float()
     # The supplied prompt is already ground-truth Vocos feature context.
     # Preserve it exactly and apply post-net refinement only to generated
     # frames in the returned prompt-plus-continuation sequence.

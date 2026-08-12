@@ -75,24 +75,41 @@ class MelPrenet(nn.Module):
         return x
 
 
+class CausalConv1d(nn.Conv1d):
+    """Length-preserving 1-D convolution that only sees current/past frames."""
+
+    def __init__(self, *args, **kwargs):
+        kernel_size = kwargs.get("kernel_size", args[2] if len(args) > 2 else None)
+        dilation = kwargs.get("dilation", 1)
+        if isinstance(kernel_size, tuple):
+            kernel_size = kernel_size[0]
+        if isinstance(dilation, tuple):
+            dilation = dilation[0]
+        self.left_padding = dilation * (kernel_size - 1)
+        kwargs["padding"] = 0
+        super().__init__(*args, **kwargs)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return super().forward(F.pad(x, (self.left_padding, 0)))
+
+
 class PostNet(nn.Module):
     def __init__(self, mel_dim: int, channels: int, layers: int, kernel_size: int, dropout: float):
         super().__init__()
         if layers < 2:
             raise ValueError("postnet_layers must be at least 2")
-        padding = (kernel_size - 1) // 2
         blocks = []
         in_channels = mel_dim
         for _ in range(layers - 1):
             blocks.extend(
                 [
-                    nn.Conv1d(in_channels, channels, kernel_size, padding=padding),
+                    CausalConv1d(in_channels, channels, kernel_size),
                     nn.Tanh(),
                     nn.Dropout(dropout),
                 ]
             )
             in_channels = channels
-        blocks.append(nn.Conv1d(in_channels, mel_dim, kernel_size, padding=padding))
+        blocks.append(CausalConv1d(in_channels, mel_dim, kernel_size))
         self.net = nn.Sequential(*blocks)
 
     def forward(self, mel: torch.Tensor) -> torch.Tensor:
@@ -231,6 +248,7 @@ class MelleModel(nn.Module):
         mel_inputs: torch.Tensor,
         mel_mask: torch.Tensor,
         sample_latent: bool = True,
+        apply_postnet: bool = True,
     ) -> Dict[str, torch.Tensor]:
         text_embeddings = self.text_embedding(text_ids)
         mel_embeddings = self.mel_prenet(mel_inputs)
@@ -270,7 +288,7 @@ class MelleModel(nn.Module):
         # before the convolutional post-net so they cannot leak into the final
         # valid frames through the convolution kernel.
         coarse = coarse * acoustic_mask.unsqueeze(-1).to(coarse.dtype)
-        refined = coarse + self.postnet(coarse)
+        refined = self.refine_mel(coarse) if apply_postnet else coarse
         refined = refined * acoustic_mask.unsqueeze(-1).to(refined.dtype)
         return {
             "coarse_mel": coarse,
@@ -279,3 +297,7 @@ class MelleModel(nn.Module):
             "logvar": logvar,
             "stop_logits": self.stop_head(mel_hidden).squeeze(-1),
         }
+
+    def refine_mel(self, coarse: torch.Tensor) -> torch.Tensor:
+        """Apply the causal post-net to a coarse mel sequence end-to-end."""
+        return coarse + self.postnet(coarse)
