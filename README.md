@@ -18,11 +18,15 @@ mel-spectrogram frames autoregressively from text, then converts them to a
 24 kHz waveform with [Vocos](https://github.com/gemelo-ai/vocos). Optional
 reference-audio prompting is supported during inference.
 
+> **Status: In development** — training stability and generated-audio quality
+> are still being actively evaluated.
+
 > [!IMPORTANT]
 > This is an independent research implementation, not the authors' official
 > code or an exact reproduction. Its 24 kHz Vocos features differ from the
-> paper's reported mel configuration. The original negative flux objective is
-> also unbounded below; monitor `flux`, `kl`, and total loss during training.
+> paper's reported mel configuration. The flux term uses a target-adaptive
+> hinge for bounded training; monitor `flux`, `kl`, and total loss during
+> training.
 
 ## Overview
 
@@ -53,8 +57,7 @@ Mel targets      [                mel₀, mel₁, mel₂, ..., melₜ₋₁]
   quantization
 - SentencePiece character tokenizer trained from the supplied manifest
 - 12-layer, 1024-dimensional decoder-only Transformer with 16 attention heads
-- Variational latent sampling, causal convolutional post-net, and learned stop
-  head
+- Variational latent sampling, convolutional post-net, and learned stop head
 - Regression, KL, spectrogram-flux, and stop-prediction objectives
 - Direct use of Vocos `MelSpectrogramFeatures` for feature compatibility
 - BF16, fused AdamW, gradient clipping, TensorBoard, tqdm, DDP, and resume
@@ -148,9 +151,13 @@ usage.
 | `BATCH_SIZE` | `16` | Utterances per GPU batch |
 | `RESUME_CKPT` | empty | Checkpoint from which to resume |
 
-Default optimization settings include a `5e-5` learning rate, 2,000 warmup
-steps, 400,000 maximum steps, and KL annealing to `0.1` over the first 10,000
-updates. Runs are written to:
+The learning rate warms up linearly to `5e-5` over 32,000 updates and then
+decays linearly to zero through update 400,000. This lower peak than the
+paper's `5e-4` accounts for this repository's much smaller effective frame
+batch. The spectrogram-flux loss uses its full `0.5` weight from the first
+update and uses each target's frame-to-frame flux as a bounded hinge margin.
+KL is disabled for the first 10,000 updates and switches to `0.1` afterward.
+Runs are written to:
 
 ```text
 runs/melle_YYYY_MM_DD_HH_MM_SS/
@@ -233,10 +240,9 @@ the `charactr/vocos-mel-24khz` checkpoint, downloaded on its first use.
   computationally expensive.
 - Prompted inference is available, but training currently predicts complete
   utterances from text without a separate acoustic-prompt split.
-- The post-net uses causal left padding so its refined loss remains
-  autoregressively consistent while training the coarse predictor end-to-end;
-  the paper specifies five convolutional blocks with kernel size 5 but does
-  not state its padding convention.
+- Following the paper, the non-causal convolutional post-net processes the
+  completed coarse mel sequence and its refined output is never fed back into
+  autoregressive generation.
 - The Vocos feature scale differs from the paper's reported 16 kHz, 80-bin,
   base-10-log configuration.
 - No pretrained MELLE checkpoint is distributed by this repository.

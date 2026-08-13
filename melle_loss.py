@@ -41,13 +41,20 @@ def melle_loss(
     kl_values = 0.5 * (logvar.exp() + (mu - targets).square() - 1.0 - logvar)
     kl = _masked_mean(kl_values, loss_mask)
 
-    # Equation (9) of MELLE: reward variation between the predicted Gaussian
-    # mean and the preceding ground-truth frame. The first continuation frame
-    # is compared with the final prompt frame.
+    # Equation (9) of MELLE encourages variation relative to the preceding
+    # ground-truth frame. A raw negative reward is unbounded below, however:
+    # increasing mu indefinitely keeps lowering the objective. Use the actual
+    # target frame-to-frame flux as an adaptive hinge margin instead. This
+    # preserves the preference for dynamic predictions while making the
+    # penalty zero once the target dynamics have been reached.
     flux_mask = loss_mask[:, 1:] & mel_mask[:, :-1]
     if targets.size(1) > 1 and flux_mask.any():
-        frame_flux = (mu[:, 1:] - targets[:, :-1]).abs().mean(dim=-1)
-        flux = -_masked_mean(frame_flux, flux_mask)
+        predicted_flux = (mu[:, 1:] - targets[:, :-1]).abs().mean(dim=-1)
+        target_flux = (targets[:, 1:] - targets[:, :-1]).abs().mean(dim=-1)
+        flux = _masked_mean(
+            F.relu(target_flux.detach() - predicted_flux),
+            flux_mask,
+        )
     else:
         flux = mu.sum() * 0.0
 

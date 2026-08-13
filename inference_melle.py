@@ -96,7 +96,8 @@ def generate(model, text_ids, prompt, config, args):
         if step + 1 >= min_steps and stop_probability >= args.stop_threshold:
             break
 
-    # Apply the causal post-net once after coarse AR generation concludes.
+    # The paper applies the non-causal post-net only after coarse AR generation
+    # concludes, so refined frames are never fed back into autoregressive input.
     coarse = known_mel.unsqueeze(0)
     model_dtype = next(model.parameters()).dtype
     refined = model.refine_mel(coarse.to(model_dtype)).float()

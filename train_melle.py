@@ -19,6 +19,7 @@ from tqdm.auto import tqdm
 from melle_dataset import MelConfig, MelleDataset, melle_collate_fn
 from melle_loss import melle_loss
 from melle_model import MelleModel, MelleModelArgs
+from melle_schedule import delayed_weight, linear_warmup_decay_lr
 from melle_tokenizer import MelleCharacterTokenizer
 
 
@@ -44,9 +45,11 @@ DROPOUT = 0.1
 LEARNING_RATE = 5e-5
 MAX_ITERS = 400_000
 WEIGHT_DECAY = 0.1
-WARMUP_ITERS = 2_000
-KL_ANNEAL_ITERS = 10_000
+WARMUP_ITERS = 32_000
+KL_WARMUP_ITERS = 10_000
 MAX_KL_WEIGHT = 0.1
+FLUX_WEIGHT = 0.5
+STOP_WEIGHT = 1.0
 MIN_LR = 0.0
 GRAD_CLIP = 1.0
 DEVICE = "cuda"
@@ -203,10 +206,13 @@ def move_batch(batch):
 
 
 def get_lr(step):
-    if step < WARMUP_ITERS:
-        return LEARNING_RATE * step / max(1, WARMUP_ITERS)
-    ratio = min(1.0, (step - WARMUP_ITERS) / max(1, MAX_ITERS - WARMUP_ITERS))
-    return LEARNING_RATE + ratio * (MIN_LR - LEARNING_RATE)
+    return linear_warmup_decay_lr(
+        step,
+        peak_lr=LEARNING_RATE,
+        warmup_steps=WARMUP_ITERS,
+        total_steps=MAX_ITERS,
+        min_lr=MIN_LR,
+    )
 
 
 def compute_losses(batch, step, sample_latent=True):
@@ -217,7 +223,11 @@ def compute_losses(batch, step, sample_latent=True):
         batch["mel_input_mask"],
         sample_latent=sample_latent,
     )
-    kl_weight = MAX_KL_WEIGHT * min(1.0, step / max(1, KL_ANNEAL_ITERS))
+    # Section 4.2: disable KL for the first 10K updates, then enable its full
+    # weight. Spectrogram flux has no warmup and is active from step zero.
+    kl_weight = delayed_weight(
+        step, weight=MAX_KL_WEIGHT, delay_steps=KL_WARMUP_ITERS
+    )
     return melle_loss(
         outputs,
         batch["mel_targets"],
@@ -225,6 +235,8 @@ def compute_losses(batch, step, sample_latent=True):
         batch["loss_mask"],
         batch["stop_targets"],
         kl_weight=kl_weight,
+        flux_weight=FLUX_WEIGHT,
+        stop_weight=STOP_WEIGHT,
     )
 
 
