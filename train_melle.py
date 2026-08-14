@@ -219,6 +219,11 @@ def get_lr(step):
 
 
 def compute_losses(batch, step, sample_latent=True):
+    if POSTNET_WEIGHT and POSTNET_ROLLOUT_STEPS > 0:
+        rollout_loss = compute_postnet_rollout_loss(batch)
+    else:
+        rollout_loss = None
+
     outputs = model(
         batch["text_ids"],
         batch["text_mask"],
@@ -245,7 +250,6 @@ def compute_losses(batch, step, sample_latent=True):
         stop_weight=STOP_WEIGHT,
     )
     if POSTNET_WEIGHT and POSTNET_ROLLOUT_STEPS > 0:
-        rollout_loss = compute_postnet_rollout_loss(batch)
         losses["postnet_rollout"] = rollout_loss
         losses["loss"] = losses["loss"] + POSTNET_WEIGHT * rollout_loss
     else:
