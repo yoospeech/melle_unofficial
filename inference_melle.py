@@ -268,6 +268,7 @@ def generate(model, text_ids, prompt, config, args):
             text_mask,
             mel_inputs,
             mel_mask,
+            prompt_lengths=torch.tensor([prompt_steps], dtype=torch.long, device=device),
             sample_latent=True,
             apply_postnet=False,
         )

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Dict
+from typing import Dict, Optional
 
 import torch
 import torch.nn.functional as F
@@ -206,25 +206,33 @@ class MelleModel(nn.Module):
         text_lengths: torch.Tensor,
         mel_lengths: torch.Tensor,
         sequence_length: int,
+        prompt_lengths: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Allow bidirectional text attention and causal attention over all mel.
+        """Allow bidirectional text/prompt attention and causal target attention.
 
         The factorization is ``p(y_t | x, y_<t)``: the complete text ``x`` is
-        visible as a fixed prefix, while all mel frames belong to the
-        autoregressive ``y`` sequence. Prompt-based training still uses the
-        same causal graph; the collate loss mask decides which leading
-        acoustic frames are fixed prompt context rather than supervised target.
+        visible as a fixed prefix. When prompt lengths are provided, leading
+        acoustic prompt frames are also a fixed bidirectional prefix; target
+        mel frames remain causal and can see all text, all prompt frames, and
+        previous target frames.
         """
+        if prompt_lengths is None:
+            prompt_lengths = torch.zeros_like(mel_lengths)
+        prompt_lengths = prompt_lengths.clamp(min=0, max=int(mel_lengths.max().item()))
         total_lengths = text_lengths + mel_lengths
         positions = torch.arange(sequence_length, device=text_lengths.device)
         queries = positions.view(1, sequence_length, 1)
         keys = positions.view(1, 1, sequence_length)
         valid_queries = queries < total_lengths.view(-1, 1, 1)
         valid_keys = keys < total_lengths.view(-1, 1, 1)
-        prefix = text_lengths.view(-1, 1, 1)
-        prefix_to_prefix = (queries < prefix) & (keys < prefix)
-        mel_causal = (queries >= prefix) & (keys <= queries)
-        allowed = valid_queries & valid_keys & (prefix_to_prefix | mel_causal)
+        prompt_prefix = (text_lengths + prompt_lengths).view(-1, 1, 1)
+        fixed_prefix = queries < prompt_prefix
+        fixed_prefix_keys = keys < prompt_prefix
+        target_queries = queries >= prompt_prefix
+        target_causal = target_queries & (keys <= queries)
+        allowed = valid_queries & valid_keys & (
+            (fixed_prefix & fixed_prefix_keys) | target_causal
+        )
         return allowed.unsqueeze(1)
 
     def forward(
@@ -233,6 +241,7 @@ class MelleModel(nn.Module):
         text_mask: torch.Tensor,
         mel_inputs: torch.Tensor,
         mel_mask: torch.Tensor,
+        prompt_lengths: Optional[torch.Tensor] = None,
         sample_latent: bool = True,
         apply_postnet: bool = True,
     ) -> Dict[str, torch.Tensor]:
@@ -250,6 +259,7 @@ class MelleModel(nn.Module):
             text_mask.sum(dim=1),
             mel_mask.sum(dim=1),
             seq_len,
+            prompt_lengths,
         )
         for layer in self.layers:
             hidden = layer(

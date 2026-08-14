@@ -182,6 +182,7 @@ def melle_collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Te
     mel_target_mask = torch.zeros(batch_size, max_mel_target, dtype=torch.bool)
     loss_mask = torch.zeros(batch_size, max_mel_target, dtype=torch.bool)
     stop_targets = torch.zeros(batch_size, max_mel_target)
+    prompt_steps = torch.zeros(batch_size, dtype=torch.long)
 
     for row, item in enumerate(batch):
         text = item["text_ids"]
@@ -198,8 +199,9 @@ def melle_collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Te
         mel_target_mask[row, :mel_len] = True
         # Match prompt-based inference: the leading acoustic frames are fixed
         # context, and only the continuation after the 3s prompt is supervised.
-        prompt_steps = int(item["prompt_steps"].item())
-        loss_mask[row, prompt_steps:mel_len] = True
+        sample_prompt_steps = int(item["prompt_steps"].item())
+        prompt_steps[row] = sample_prompt_steps
+        loss_mask[row, sample_prompt_steps:mel_len] = True
         stop_targets[row, mel_len - 1] = 1.0
 
     return {
@@ -211,4 +213,5 @@ def melle_collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Te
         "mel_target_mask": mel_target_mask,
         "loss_mask": loss_mask,
         "stop_targets": stop_targets,
+        "prompt_steps": prompt_steps,
     }

@@ -222,6 +222,7 @@ def compute_losses(batch, step, sample_latent=True):
         batch["text_mask"],
         batch["mel_inputs"],
         batch["mel_input_mask"],
+        prompt_lengths=batch["prompt_steps"],
         sample_latent=sample_latent,
     )
     # Section 4.2: disable KL for the first 10K updates, then enable its full
