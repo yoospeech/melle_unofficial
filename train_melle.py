@@ -49,6 +49,8 @@ WARMUP_ITERS = 32_000
 KL_WARMUP_ITERS = 10_000
 MAX_KL_WEIGHT = 0.1
 FLUX_WEIGHT = 0.5
+POSTNET_WEIGHT = 1.0
+POSTNET_ROLLOUT_STEPS = int(os.environ.get("POSTNET_ROLLOUT_STEPS", "1"))
 STOP_WEIGHT = 1.0
 MIN_LR = 0.0
 GRAD_CLIP = 1.0
@@ -224,13 +226,14 @@ def compute_losses(batch, step, sample_latent=True):
         batch["mel_input_mask"],
         prompt_lengths=batch["prompt_steps"],
         sample_latent=sample_latent,
+        apply_postnet=False,
     )
     # Section 4.2: disable KL for the first 10K updates, then enable its full
     # weight. Spectrogram flux has no warmup and is active from step zero.
     kl_weight = delayed_weight(
         step, weight=MAX_KL_WEIGHT, delay_steps=KL_WARMUP_ITERS
     )
-    return melle_loss(
+    losses = melle_loss(
         outputs,
         batch["mel_targets"],
         batch["mel_target_mask"],
@@ -238,7 +241,81 @@ def compute_losses(batch, step, sample_latent=True):
         batch["stop_targets"],
         kl_weight=kl_weight,
         flux_weight=FLUX_WEIGHT,
+        postnet_weight=0.0,
         stop_weight=STOP_WEIGHT,
+    )
+    if POSTNET_WEIGHT and POSTNET_ROLLOUT_STEPS > 0:
+        rollout_loss = compute_postnet_rollout_loss(batch)
+        losses["postnet_rollout"] = rollout_loss
+        losses["loss"] = losses["loss"] + POSTNET_WEIGHT * rollout_loss
+    else:
+        losses["postnet_rollout"] = losses["loss"] * 0.0
+    return losses
+
+
+def compute_postnet_rollout_loss(batch):
+    prompt_steps = batch["prompt_steps"]
+    rollout_steps = min(
+        POSTNET_ROLLOUT_STEPS,
+        max(0, batch["mel_targets"].size(1) - int(prompt_steps.min().item())),
+    )
+    if rollout_steps < 1:
+        return batch["mel_targets"].sum() * 0.0
+
+    with torch.no_grad():
+        known_mel = []
+        for row in range(batch["mel_targets"].size(0)):
+            prompt_len = int(prompt_steps[row].item())
+            known_mel.append(batch["mel_targets"][row, :prompt_len])
+
+        for _ in range(rollout_steps):
+            max_len = max(item.size(0) for item in known_mel)
+            mel_inputs = batch["mel_targets"].new_zeros(
+                len(known_mel), max_len, batch["mel_targets"].size(-1)
+            )
+            mel_mask = torch.zeros(
+                len(known_mel), max_len, dtype=torch.bool, device=mel_inputs.device
+            )
+            for row, mel in enumerate(known_mel):
+                mel_inputs[row, : mel.size(0)] = mel
+                mel_mask[row, : mel.size(0)] = True
+            rollout_outputs = model(
+                batch["text_ids"],
+                batch["text_mask"],
+                mel_inputs,
+                mel_mask,
+                prompt_lengths=prompt_steps,
+                sample_latent=False,
+                apply_postnet=False,
+            )
+            next_frames = rollout_outputs["coarse_mel"][
+                torch.arange(len(known_mel), device=mel_inputs.device),
+                mel_mask.sum(dim=1),
+            ].float()
+            known_mel = [
+                torch.cat([mel, next_frames[row : row + 1].to(mel.dtype)], dim=0)
+                for row, mel in enumerate(known_mel)
+            ]
+
+        max_len = max(item.size(0) for item in known_mel)
+        rollout = batch["mel_targets"].new_zeros(
+            len(known_mel), max_len, batch["mel_targets"].size(-1)
+        )
+        rollout_mask = torch.zeros(
+            len(known_mel), max_len, dtype=torch.bool, device=rollout.device
+        )
+        for row, mel in enumerate(known_mel):
+            rollout[row, : mel.size(0)] = mel
+            rollout_mask[row, int(prompt_steps[row].item()) : mel.size(0)] = True
+
+    refined = raw_model.refine_mel(rollout.detach().to(next(raw_model.parameters()).dtype)).float()
+    targets = batch["mel_targets"][:, : refined.size(1)].float()
+    valid_mask = rollout_mask & batch["mel_target_mask"][:, : refined.size(1)]
+    return (
+        (refined - targets).abs()[valid_mask].mean()
+        + (refined - targets).square()[valid_mask].mean()
+        if valid_mask.any()
+        else refined.sum() * 0.0
     )
 
 
@@ -247,7 +324,10 @@ def estimate_loss(step):
     model.eval()
     result = {}
     for split, iterator in (("train", train_iter), ("val", val_iter)):
-        totals = {name: 0.0 for name in ("loss", "regression", "kl", "flux", "stop")}
+        totals = {
+            name: 0.0
+            for name in ("loss", "regression", "kl", "flux", "stop", "postnet_rollout")
+        }
         eval_progress = tqdm(
             range(EVAL_ITERS),
             desc=f"eval/{split}",
@@ -317,7 +397,10 @@ for iter_num in progress:
                     os.path.join(OUT_DIR, "ckpt.pt"),
                 )
 
-    accumulated = {name: 0.0 for name in ("loss", "regression", "kl", "flux", "stop")}
+    accumulated = {
+        name: 0.0
+        for name in ("loss", "regression", "kl", "flux", "stop", "postnet_rollout")
+    }
     for micro_step in range(GRAD_ACCUM_STEPS):
         sync_context = (
             model.no_sync()
@@ -351,6 +434,7 @@ for iter_num in progress:
             kl=f"{accumulated['kl']:.4f}",
             flux=f"{accumulated['flux']:.4f}",
             stop=f"{accumulated['stop']:.4f}",
+            postnet=f"{accumulated['postnet_rollout']:.4f}",
             lr=f"{lr:.2e}",
             ms_per_step=f"{elapsed_ms:.1f}",
         )

@@ -24,6 +24,7 @@ def melle_loss(
     stop_targets: torch.Tensor,
     kl_weight: float,
     flux_weight: float = 0.5,
+    postnet_weight: float = 1.0,
     stop_weight: float = 1.0,
     stop_positive_weight: float = 100.0,
 ) -> Dict[str, torch.Tensor]:
@@ -32,12 +33,16 @@ def melle_loss(
     mu = outputs["mu"]
     logvar = outputs["logvar"]
 
-    regression = (
-        _masked_mean((coarse - targets).abs(), loss_mask)
-        + _masked_mean((coarse - targets).square(), loss_mask)
-        + _masked_mean((refined - targets).abs(), loss_mask)
-        + _masked_mean((refined - targets).square(), loss_mask)
+    coarse_regression = _masked_mean((coarse - targets).abs(), loss_mask) + _masked_mean(
+        (coarse - targets).square(), loss_mask
     )
+    postnet_regression = (
+        _masked_mean((refined - targets).abs(), loss_mask)
+        + _masked_mean((refined - targets).square(), loss_mask)
+        if postnet_weight
+        else coarse.sum() * 0.0
+    )
+    regression = coarse_regression + postnet_weight * postnet_regression
     kl_values = 0.5 * (logvar.exp() + (mu - targets).square() - 1.0 - logvar)
     kl = _masked_mean(kl_values, loss_mask)
 
@@ -73,6 +78,8 @@ def melle_loss(
     return {
         "loss": total,
         "regression": regression,
+        "coarse_regression": coarse_regression,
+        "postnet_regression": postnet_regression,
         "kl": kl,
         "flux": flux,
         "stop": stop,

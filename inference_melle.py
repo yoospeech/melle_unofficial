@@ -401,6 +401,9 @@ def main():
         if prompt_steps
         else "prompt=none; "
     )
+    generated_audio = best["generated_audio"]
+    generated_rms = generated_audio.square().mean().sqrt().item()
+    generated_peak = generated_audio.abs().max().item()
     print(
         "Feature statistics: "
         f"{prompt_stats}"
@@ -408,6 +411,10 @@ def main():
         f"std={generated_features.std().item():.3f}, "
         f"min={generated_features.min().item():.3f}, "
         f"max={generated_features.max().item():.3f}"
+    )
+    print(
+        "Generated audio statistics: "
+        f"rms={generated_rms:.6f}, peak={generated_peak:.6f}"
     )
     torchaudio.save(args.output, best["audio"], config.sample_rate)
     print(

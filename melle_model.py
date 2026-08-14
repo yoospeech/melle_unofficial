@@ -218,7 +218,8 @@ class MelleModel(nn.Module):
         """
         if prompt_lengths is None:
             prompt_lengths = torch.zeros_like(mel_lengths)
-        prompt_lengths = prompt_lengths.clamp(min=0, max=int(mel_lengths.max().item()))
+        prompt_lengths = prompt_lengths.clamp(min=0)
+        prompt_lengths = torch.minimum(prompt_lengths, mel_lengths)
         total_lengths = text_lengths + mel_lengths
         positions = torch.arange(sequence_length, device=text_lengths.device)
         queries = positions.view(1, sequence_length, 1)
