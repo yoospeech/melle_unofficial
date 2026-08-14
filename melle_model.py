@@ -211,8 +211,9 @@ class MelleModel(nn.Module):
 
         The factorization is ``p(y_t | x, y_<t)``: the complete text ``x`` is
         visible as a fixed prefix, while all mel frames belong to the
-        autoregressive ``y`` sequence. Acoustic prompting is an inference
-        operation; training predicts the complete mel target.
+        autoregressive ``y`` sequence. Prompt-based training still uses the
+        same causal graph; the collate loss mask decides which leading
+        acoustic frames are fixed prompt context rather than supervised target.
         """
         total_lengths = text_lengths + mel_lengths
         positions = torch.arange(sequence_length, device=text_lengths.device)

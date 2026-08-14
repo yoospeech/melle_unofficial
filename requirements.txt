@@ -6,6 +6,8 @@ numpy
 PyYAML
 scipy
 sentencepiece
+transformers
+faster-whisper
 tensorboard
 torch
 torchaudio

@@ -218,6 +218,34 @@ Useful generation controls include `--min-new-seconds`,
 `--max-new-seconds`, `--stop-threshold`, and `--seed`. The default decoder is
 the `charactr/vocos-mel-24khz` checkpoint, downloaded on its first use.
 
+Optional ASR scoring uses `faster-whisper` by default. When a prompt is
+present, only the generated continuation is transcribed:
+
+```bash
+bash inference_melle.sh \
+  --checkpoint ./runs/melle_.../checkpoints/ckpt.pt \
+  --tokenizer ./melle_tokenizer.model \
+  --prompt-audio ./reference.wav \
+  --text "Prompt transcript. I see a cat." \
+  --asr-reference "I see a cat." \
+  --asr-backend faster-whisper \
+  --asr-model tiny.en \
+  --output ./generated.wav
+```
+
+The command prints the ASR hypothesis, space-insensitive character error rate
+(sCER), and word error rate (WER). The first use downloads the selected ASR
+model from Hugging Face. To sample several seeds and retain the candidate with
+the lowest sCER, add these options to the command:
+
+```bash
+  --asr-reference "I see a cat." \
+  --asr-backend faster-whisper \
+  --asr-model tiny.en \
+  --seed 0 \
+  --seed-search 5
+```
+
 ## Repository layout
 
 ```text

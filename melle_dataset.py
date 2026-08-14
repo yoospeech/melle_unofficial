@@ -155,9 +155,11 @@ class MelleDataset(Dataset):
                 f"within max_seq_len={self.max_seq_len}"
             )
         mel = mel[:max_mel_len]
+        prompt_steps = min(self.mel_config.prompt_steps, max(0, mel.size(0) - 1))
         return {
             "text_ids": text,
             "mel_targets": mel,
+            "prompt_steps": torch.tensor(prompt_steps, dtype=torch.long),
         }
 
 
@@ -194,10 +196,10 @@ def melle_collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Te
         mel_targets[row, :mel_len] = mel
         mel_input_mask[row, :prediction_len] = True
         mel_target_mask[row, :mel_len] = True
-        # EOS predicts y[0], and every ground-truth mel frame is supervised.
-        # The leading acoustic frames still serve as the inference prompt, but
-        # training follows p(y|x) over the complete mel target.
-        loss_mask[row, :mel_len] = True
+        # Match prompt-based inference: the leading acoustic frames are fixed
+        # context, and only the continuation after the 3s prompt is supervised.
+        prompt_steps = int(item["prompt_steps"].item())
+        loss_mask[row, prompt_steps:mel_len] = True
         stop_targets[row, mel_len - 1] = 1.0
 
     return {

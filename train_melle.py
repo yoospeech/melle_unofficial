@@ -118,7 +118,8 @@ if len(full_dataset) < 2:
 if master_process:
     print(
         f"Duration filter: {MIN_DURATION_SEC:.1f}s to {MAX_DURATION_SEC:.1f}s; "
-        "training predicts the complete mel target from text"
+        f"training uses a fixed {mel_config.prompt_duration_sec:.1f}s acoustic prompt "
+        "and supervises the continuation"
     )
 
 val_size = max(1, round(len(full_dataset) * VAL_RATIO))
