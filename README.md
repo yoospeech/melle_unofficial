@@ -182,6 +182,26 @@ RESUME_CKPT=./runs/melle_.../checkpoints/ckpt.pt \
 bash train_melle.sh
 ```
 
+### Post-net fine-tuning
+
+The main training stage optimizes the autoregressive coarse-mel model and keeps
+the post-net frozen. After coarse training converges, fine-tune only the
+post-net on detached autoregressive rollouts:
+
+```bash
+bash finetune_melle_postnet.sh \
+  --checkpoint ./runs/melle_.../checkpoints/ckpt.pt \
+  --manifest /absolute/path/to/manifest.json \
+  --tokenizer ./melle_character_tokenizer.model \
+  --batch-size 4 \
+  --rollout-steps 32
+```
+
+The language model remains frozen during this stage. Add `--sample-latent` to
+expose the post-net to sampled coarse frames after deterministic fine-tuning is
+stable. Post-net checkpoints are written under
+`runs/melle_postnet_YYYY_MM_DD_HH_MM_SS/checkpoints/ckpt.pt`.
+
 ## Inference
 
 ### Text only

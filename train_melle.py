@@ -26,15 +26,15 @@ from melle_tokenizer import MelleCharacterTokenizer
 MANIFEST_PATH = os.environ.get("MANIFEST_PATH", "manifest.json")
 TOKENIZER_PATH = os.environ.get("TOKENIZER_PATH", "melle_character_tokenizer.model")
 RESUME_CKPT = os.environ.get("RESUME_CKPT", "")
-LOG_INTERVAL = 5
+LOG_INTERVAL = 1
 EVAL_INTERVAL = 500
-EVAL_ITERS = 50
+EVAL_ITERS = 10
 SAVE_CKPT = True
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "16"))
 NUM_WORKERS = min(8, os.cpu_count() or 1)
 MAX_SEQ_LEN = 2048
 MAX_DURATION_SEC = 10.0
-MIN_DURATION_SEC = 4.0
+MIN_DURATION_SEC = 6.0
 VAL_RATIO = 0.001
 REDUCTION_FACTOR = 1
 DIM = 1024
@@ -49,8 +49,6 @@ WARMUP_ITERS = 32_000
 KL_WARMUP_ITERS = 10_000
 MAX_KL_WEIGHT = 0.1
 FLUX_WEIGHT = 0.5
-POSTNET_WEIGHT = 1.0
-POSTNET_ROLLOUT_STEPS = int(os.environ.get("POSTNET_ROLLOUT_STEPS", "1"))
 STOP_WEIGHT = 1.0
 MIN_LR = 0.0
 GRAD_CLIP = 1.0
@@ -182,6 +180,11 @@ model_args = MelleModelArgs(
     dropout=DROPOUT,
 )
 model = MelleModel(model_args).to(device)
+# Stage 1 trains only the autoregressive coarse-mel model.  Keep the post-net
+# in checkpoints for a separate inference-aware fine-tuning stage, but exclude
+# it from gradient tracking here.
+for parameter in model.postnet.parameters():
+    parameter.requires_grad_(False)
 optimizer_kwargs = {
     "lr": LEARNING_RATE,
     "betas": (0.9, 0.95),
@@ -219,11 +222,6 @@ def get_lr(step):
 
 
 def compute_losses(batch, step, sample_latent=True):
-    if POSTNET_WEIGHT and POSTNET_ROLLOUT_STEPS > 0:
-        rollout_loss = compute_postnet_rollout_loss(batch)
-    else:
-        rollout_loss = None
-
     outputs = model(
         batch["text_ids"],
         batch["text_mask"],
@@ -246,81 +244,9 @@ def compute_losses(batch, step, sample_latent=True):
         batch["stop_targets"],
         kl_weight=kl_weight,
         flux_weight=FLUX_WEIGHT,
-        postnet_weight=0.0,
         stop_weight=STOP_WEIGHT,
     )
-    if POSTNET_WEIGHT and POSTNET_ROLLOUT_STEPS > 0:
-        losses["postnet_rollout"] = rollout_loss
-        losses["loss"] = losses["loss"] + POSTNET_WEIGHT * rollout_loss
-    else:
-        losses["postnet_rollout"] = losses["loss"] * 0.0
     return losses
-
-
-def compute_postnet_rollout_loss(batch):
-    prompt_steps = batch["prompt_steps"]
-    rollout_steps = min(
-        POSTNET_ROLLOUT_STEPS,
-        max(0, batch["mel_targets"].size(1) - int(prompt_steps.min().item())),
-    )
-    if rollout_steps < 1:
-        return batch["mel_targets"].sum() * 0.0
-
-    with torch.no_grad():
-        known_mel = []
-        for row in range(batch["mel_targets"].size(0)):
-            prompt_len = int(prompt_steps[row].item())
-            known_mel.append(batch["mel_targets"][row, :prompt_len])
-
-        for _ in range(rollout_steps):
-            max_len = max(item.size(0) for item in known_mel)
-            mel_inputs = batch["mel_targets"].new_zeros(
-                len(known_mel), max_len, batch["mel_targets"].size(-1)
-            )
-            mel_mask = torch.zeros(
-                len(known_mel), max_len, dtype=torch.bool, device=mel_inputs.device
-            )
-            for row, mel in enumerate(known_mel):
-                mel_inputs[row, : mel.size(0)] = mel
-                mel_mask[row, : mel.size(0)] = True
-            rollout_outputs = model(
-                batch["text_ids"],
-                batch["text_mask"],
-                mel_inputs,
-                mel_mask,
-                prompt_lengths=prompt_steps,
-                sample_latent=False,
-                apply_postnet=False,
-            )
-            next_frames = rollout_outputs["coarse_mel"][
-                torch.arange(len(known_mel), device=mel_inputs.device),
-                mel_mask.sum(dim=1),
-            ].float()
-            known_mel = [
-                torch.cat([mel, next_frames[row : row + 1].to(mel.dtype)], dim=0)
-                for row, mel in enumerate(known_mel)
-            ]
-
-        max_len = max(item.size(0) for item in known_mel)
-        rollout = batch["mel_targets"].new_zeros(
-            len(known_mel), max_len, batch["mel_targets"].size(-1)
-        )
-        rollout_mask = torch.zeros(
-            len(known_mel), max_len, dtype=torch.bool, device=rollout.device
-        )
-        for row, mel in enumerate(known_mel):
-            rollout[row, : mel.size(0)] = mel
-            rollout_mask[row, int(prompt_steps[row].item()) : mel.size(0)] = True
-
-    refined = raw_model.refine_mel(rollout.detach().to(next(raw_model.parameters()).dtype)).float()
-    targets = batch["mel_targets"][:, : refined.size(1)].float()
-    valid_mask = rollout_mask & batch["mel_target_mask"][:, : refined.size(1)]
-    return (
-        (refined - targets).abs()[valid_mask].mean()
-        + (refined - targets).square()[valid_mask].mean()
-        if valid_mask.any()
-        else refined.sum() * 0.0
-    )
 
 
 @torch.no_grad()
@@ -330,7 +256,7 @@ def estimate_loss(step):
     for split, iterator in (("train", train_iter), ("val", val_iter)):
         totals = {
             name: 0.0
-            for name in ("loss", "regression", "kl", "flux", "stop", "postnet_rollout")
+            for name in ("loss", "regression", "kl", "flux", "stop")
         }
         eval_progress = tqdm(
             range(EVAL_ITERS),
@@ -397,13 +323,14 @@ for iter_num in progress:
                         "iter_num": iter_num,
                         "model_args": asdict(model_args),
                         "mel_config": asdict(mel_config),
+                        "training_stage": "coarse",
                     },
                     os.path.join(OUT_DIR, "ckpt.pt"),
                 )
 
     accumulated = {
         name: 0.0
-        for name in ("loss", "regression", "kl", "flux", "stop", "postnet_rollout")
+        for name in ("loss", "regression", "kl", "flux", "stop")
     }
     for micro_step in range(GRAD_ACCUM_STEPS):
         sync_context = (
@@ -438,7 +365,6 @@ for iter_num in progress:
             kl=f"{accumulated['kl']:.4f}",
             flux=f"{accumulated['flux']:.4f}",
             stop=f"{accumulated['stop']:.4f}",
-            postnet=f"{accumulated['postnet_rollout']:.4f}",
             lr=f"{lr:.2e}",
             ms_per_step=f"{elapsed_ms:.1f}",
         )
