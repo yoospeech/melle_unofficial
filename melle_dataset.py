@@ -35,7 +35,7 @@ class MelConfig:
     n_mels: int = 100
     padding: str = "center"
     reduction_factor: int = 1
-    prompt_duration_sec: float = 3.0
+    prompt_duration_sec: float = 4.0
 
     @property
     def feature_dim(self) -> int:
@@ -65,7 +65,7 @@ class MelleDataset(Dataset):
         mel_config: MelConfig = MelConfig(),
         max_seq_len: int = 2048,
         max_duration_sec: Optional[float] = 10.0,
-        min_duration_sec: float = 4.0,
+        min_duration_sec: float = 6.0,
     ) -> None:
         if mel_config.reduction_factor < 1:
             raise ValueError("reduction_factor must be at least 1")

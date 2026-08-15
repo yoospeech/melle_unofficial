@@ -102,10 +102,10 @@ each sample:
 ]
 ```
 
-- Samples are filtered to the default duration range of 4–10 seconds.
+- Samples are filtered to the default duration range of 6–10 seconds.
 - Audio is resampled to 24 kHz when necessary.
-- Training uses the complete utterance as its mel target; there is no fixed
-  three-second acoustic prompt in the training sample.
+- Training uses a fixed four-second acoustic prompt (exactly 375 frames at
+  24 kHz with a hop length of 256) and supervises its continuation.
 - After filtering, 0.1% of samples are deterministically reserved for
   validation.
 - `speaker` is accepted as manifest metadata but is not currently passed to a
