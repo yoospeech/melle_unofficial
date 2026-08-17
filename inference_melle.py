@@ -42,6 +42,11 @@ def parse_args():
     parser.add_argument("--stop-threshold", type=float, default=0.7)
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument(
+        "--skip-postnet",
+        action="store_true",
+        help="Return the raw coarse AR mel (or use an older coarse-only checkpoint)",
+    )
+    parser.add_argument(
         "--seed-search",
         type=int,
         default=1,
@@ -248,7 +253,7 @@ def generate(model, text_ids, prompt, config, args):
     min_steps = max(1, round(args.min_new_seconds * config.sample_rate / config.hop_length))
     max_steps = max(min_steps, round(args.max_new_seconds * config.sample_rate / config.hop_length))
     # A full-length final context can still predict one additional frame.
-    available_steps = model.args.max_seq_len - text_ids.size(1) - prompt_steps + 1
+    available_steps = model.args.max_seq_len - text_ids.size(1) - prompt_steps
     if available_steps < min_steps:
         raise ValueError(
             "text and prompt leave insufficient model context for the requested "
@@ -268,7 +273,6 @@ def generate(model, text_ids, prompt, config, args):
             text_mask,
             mel_inputs,
             mel_mask,
-            prompt_lengths=torch.tensor([prompt_steps], dtype=torch.long, device=device),
             sample_latent=True,
             apply_postnet=False,
         )
@@ -278,9 +282,12 @@ def generate(model, text_ids, prompt, config, args):
         if step + 1 >= min_steps and stop_probability >= args.stop_threshold:
             break
 
+    coarse = known_mel.unsqueeze(0)
+    if args.skip_postnet:
+        return coarse[0], prompt_steps
+
     # The paper applies the non-causal post-net only after coarse AR generation
     # concludes, so refined frames are never fed back into autoregressive input.
-    coarse = known_mel.unsqueeze(0)
     model_dtype = next(model.parameters()).dtype
     refined = model.refine_mel(coarse.to(model_dtype)).float()
     # The supplied prompt is already ground-truth Vocos feature context.

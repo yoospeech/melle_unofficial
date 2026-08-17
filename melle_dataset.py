@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import math
 import os
 import sys
 from dataclasses import dataclass
@@ -35,21 +34,14 @@ class MelConfig:
     n_mels: int = 100
     padding: str = "center"
     reduction_factor: int = 1
-    prompt_duration_sec: float = 4.0
+    # Retained only so checkpoints written before prompt-split removal load.
+    # Training data construction no longer uses this value.
+    prompt_duration_sec: float = 3.0
+    trim_top_db: float = 30.0
 
     @property
     def feature_dim(self) -> int:
         return self.n_mels * self.reduction_factor
-
-    @property
-    def prompt_frames(self) -> int:
-        frames_per_second = self.sample_rate / self.hop_length
-        return round(self.prompt_duration_sec * frames_per_second)
-
-    @property
-    def prompt_steps(self) -> int:
-        return math.ceil(self.prompt_frames / self.reduction_factor)
-
 
 class MelleDataset(Dataset):
     """Return text tokens and continuous log-mel targets.
@@ -65,7 +57,7 @@ class MelleDataset(Dataset):
         mel_config: MelConfig = MelConfig(),
         max_seq_len: int = 2048,
         max_duration_sec: Optional[float] = 10.0,
-        min_duration_sec: float = 6.0,
+        min_duration_sec: float = 4.0,
     ) -> None:
         if mel_config.reduction_factor < 1:
             raise ValueError("reduction_factor must be at least 1")
@@ -126,6 +118,11 @@ class MelleDataset(Dataset):
             waveform = torchaudio.functional.resample(
                 waveform, orig_freq=source_rate, new_freq=cfg.sample_rate
             )
+        wav_np = waveform.squeeze(0).numpy()
+        wav_np, _ = librosa.effects.trim(wav_np, top_db=cfg.trim_top_db)
+        if wav_np.size == 0:
+            raise ValueError(f"audio became empty after trimming: {audio_path}")
+        waveform = torch.from_numpy(wav_np.copy()).unsqueeze(0)
         with torch.no_grad():
             # Vocos returns [B, mel, frames]; MELLE uses [frames, mel].
             features = self.feature_extractor(waveform).squeeze(0).transpose(0, 1)
@@ -155,11 +152,13 @@ class MelleDataset(Dataset):
                 f"within max_seq_len={self.max_seq_len}"
             )
         mel = mel[:max_mel_len]
-        prompt_steps = min(self.mel_config.prompt_steps, max(0, mel.size(0) - 1))
+        if mel.size(0) < 2:
+            raise ValueError(
+                f"audio must provide at least two mel steps, got {mel.size(0)}"
+            )
         return {
             "text_ids": text,
             "mel_targets": mel,
-            "prompt_steps": torch.tensor(prompt_steps, dtype=torch.long),
         }
 
 
@@ -168,10 +167,10 @@ def melle_collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Te
         raise ValueError("cannot collate an empty batch")
     batch_size = len(batch)
     max_text = max(item["text_ids"].numel() for item in batch)
-    # EOS predicts y[0], and each input mel y[t] predicts y[t+1]. No synthetic
-    # acoustic GO frame is needed.
+    # The model prepends a learned mel_BOS that predicts y[0], and each input
+    # mel y[t] predicts y[t+1].
     max_mel_target = max(item["mel_targets"].size(0) for item in batch)
-    max_mel_input = max_mel_target - 1
+    max_mel_input = max(0, max_mel_target - 1)
     feature_dim = batch[0]["mel_targets"].size(1)
 
     text_ids = torch.zeros(batch_size, max_text, dtype=torch.long)
@@ -180,9 +179,7 @@ def melle_collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Te
     mel_targets = torch.zeros(batch_size, max_mel_target, feature_dim)
     mel_input_mask = torch.zeros(batch_size, max_mel_input, dtype=torch.bool)
     mel_target_mask = torch.zeros(batch_size, max_mel_target, dtype=torch.bool)
-    loss_mask = torch.zeros(batch_size, max_mel_target, dtype=torch.bool)
     stop_targets = torch.zeros(batch_size, max_mel_target)
-    prompt_steps = torch.zeros(batch_size, dtype=torch.long)
 
     for row, item in enumerate(batch):
         text = item["text_ids"]
@@ -197,12 +194,7 @@ def melle_collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Te
         mel_targets[row, :mel_len] = mel
         mel_input_mask[row, :prediction_len] = True
         mel_target_mask[row, :mel_len] = True
-        # Match prompt-based inference: the leading acoustic frames are fixed
-        # context, and only the continuation after the 3s prompt is supervised.
-        sample_prompt_steps = int(item["prompt_steps"].item())
-        prompt_steps[row] = sample_prompt_steps
-        loss_mask[row, sample_prompt_steps:mel_len] = True
-        stop_targets[row, mel_len - 1] = 1.0
+        stop_targets[row, prediction_len] = 1.0
 
     return {
         "text_ids": text_ids,
@@ -211,7 +203,5 @@ def melle_collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Te
         "mel_targets": mel_targets,
         "mel_input_mask": mel_input_mask,
         "mel_target_mask": mel_target_mask,
-        "loss_mask": loss_mask,
         "stop_targets": stop_targets,
-        "prompt_steps": prompt_steps,
     }

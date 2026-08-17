@@ -24,31 +24,30 @@ reference-audio prompting is supported during inference.
 > [!IMPORTANT]
 > This is an independent research implementation, not the authors' official
 > code or an exact reproduction. Its 24 kHz Vocos features differ from the
-> paper's reported mel configuration. The flux term uses a target-adaptive
-> hinge for bounded training; monitor `flux`, `kl`, and total loss during
-> training.
+> paper's reported mel configuration. The flux term follows Equation (9)'s
+> negative L1 reward; monitor `flux`, `kl`, and total loss during training.
 
 ## Overview
 
 ```text
-Text ──> character tokenizer ──> prefix Transformer ──> continuous mel ──> Vocos ──> 24 kHz audio
-                                     │
-                                     └── EOS hidden state predicts the first mel frame
+Text ──> character tokenizer ──> prefix Transformer decoder ──> continuous mel ──> Vocos ──> 24 kHz audio
+                                             │
+                                             └── learned mel BOS predicts the first mel frame
 ```
 
-The training sequence is aligned without a synthetic acoustic `GO` token:
+The training sequence uses a learned acoustic `mel_BOS` embedding:
 
 ```text
-Full sequence    [BOS, text ..., EOS, mel₀, mel₁, ..., melₜ₋₂, melₜ₋₁]
-Decoder input    [BOS, text ..., EOS, mel₀, mel₁, ..., melₜ₋₂]
-Acoustic queries [                 EOS, mel₀, mel₁, ..., melₜ₋₂]
-Mel targets      [                mel₀, mel₁, mel₂, ..., melₜ₋₁]
+Full sequence    [text_BOS, text ..., text_EOS, mel_BOS, mel₀, ..., melₜ₋₁]
+Decoder input    [text_BOS, text ..., text_EOS, mel_BOS, mel₀, ..., melₜ₋₂]
+Acoustic queries [                          mel_BOS, mel₀, ..., melₜ₋₂]
+Mel targets      [                             mel₀, mel₁, ..., melₜ₋₁]
 ```
 
 | Sequence region | Attention | Training loss |
 | --- | --- | --- |
-| Valid text tokens | Fully visible text prefix | Excluded |
-| All valid mel frames | Causal over text and earlier mel frames | Included |
+| Valid text tokens | Bidirectional over the complete text prefix | Excluded |
+| All valid mel frames | Complete text prefix and causal acoustic history | Included |
 | Padding | Blocked as both key and query | Excluded |
 
 ## Highlights
@@ -57,7 +56,8 @@ Mel targets      [                mel₀, mel₁, mel₂, ..., melₜ₋₁]
   quantization
 - SentencePiece character tokenizer trained from the supplied manifest
 - 12-layer, 1024-dimensional decoder-only Transformer with 16 attention heads
-- Variational latent sampling, convolutional post-net, and learned stop head
+- 256-channel mel pre-net and latent residual MLP, variational sampling,
+  BatchNorm/Tanh convolutional post-net, and learned stop head
 - Regression, KL, spectrogram-flux, and stop-prediction objectives
 - Direct use of Vocos `MelSpectrogramFeatures` for feature compatibility
 - BF16, fused AdamW, gradient clipping, TensorBoard, tqdm, DDP, and resume
@@ -102,10 +102,14 @@ each sample:
 ]
 ```
 
-- Samples are filtered to the default duration range of 6–10 seconds.
+- Samples are filtered to the default duration range of 4–10 seconds.
 - Audio is resampled to 24 kHz when necessary.
-- Training uses a fixed four-second acoustic prompt (exactly 375 frames at
-  24 kHz with a hop length of 256) and supervises its continuation.
+- Leading and trailing low-energy regions are trimmed with
+  `librosa.effects.trim(top_db=40)` before mel extraction.
+- End-to-end training uses the complete utterance as a standard next-frame
+  teacher-forcing sequence, matching `melle_comp`; no acoustic prompt/prefix
+  split is created in the training dataset. Inference can still condition on a
+  supplied reference audio at its original full duration.
 - After filtering, 0.1% of samples are deterministically reserved for
   validation.
 - `speaker` is accepted as manifest metadata but is not currently passed to a
@@ -155,8 +159,12 @@ The learning rate warms up linearly to `5e-5` over 32,000 updates and then
 decays linearly to zero through update 400,000. This lower peak than the
 paper's `5e-4` accounts for this repository's much smaller effective frame
 batch. The spectrogram-flux loss uses its full `0.5` weight from the first
-update and uses each target's frame-to-frame flux as a bounded hinge margin.
+update and follows Equation (9), comparing each predicted mean with the
+preceding ground-truth frame within the same utterance.
 KL is disabled for the first 10,000 updates and switches to `0.1` afterward.
+Regression, KL, flux, and stop losses sum over acoustic dimensions as in the
+paper, then divide by the padded batch's valid-frame mask sum. This reports and
+optimizes the same per-frame unit used by `melle_comp` logging.
 Runs are written to:
 
 ```text
@@ -182,32 +190,12 @@ RESUME_CKPT=./runs/melle_.../checkpoints/ckpt.pt \
 bash train_melle.sh
 ```
 
-### Post-net fine-tuning
-
-The main training stage optimizes the autoregressive coarse-mel model and keeps
-the post-net frozen. After coarse training converges, fine-tune only the
-post-net on detached autoregressive rollouts:
-
-```bash
-bash finetune_melle_postnet.sh \
-  --checkpoint ./runs/melle_.../checkpoints/ckpt.pt \
-  --manifest /absolute/path/to/manifest.json \
-  --tokenizer ./melle_character_tokenizer.model \
-  --batch-size 4 \
-  --rollout-steps 32
-```
-
-The language model remains frozen during this stage. Add `--sample-latent` to
-expose the post-net to sampled coarse frames after deterministic fine-tuning is
-stable. Post-net checkpoints are written under
-`runs/melle_postnet_YYYY_MM_DD_HH_MM_SS/checkpoints/ckpt.pt`.
-
 ## Inference
 
 ### Text only
 
-Text-only synthesis starts generation from the text `EOS` hidden state, which
-matches the first-frame prediction used during training.
+Text-only synthesis starts generation from the learned acoustic `mel_BOS`
+embedding, matching the first-frame prediction used during training.
 
 ```bash
 bash inference_melle.sh \
@@ -216,6 +204,9 @@ bash inference_melle.sh \
   --text "Nice to meet you." \
   --output ./generated.wav
 ```
+
+Use `--skip-postnet` only to inspect the raw autoregressive coarse output or
+when loading an older coarse-only checkpoint whose post-net was frozen.
 
 ### Optional acoustic prompt
 
@@ -290,7 +281,8 @@ the lowest sCER, add these options to the command:
   utterances from text without a separate acoustic-prompt split.
 - Following the paper, the non-causal convolutional post-net processes the
   completed coarse mel sequence and its refined output is never fed back into
-  autoregressive generation.
+  autoregressive generation. During training, coarse and refined reconstruction
+  losses are optimized jointly in one end-to-end graph.
 - The Vocos feature scale differs from the paper's reported 16 kHz, 80-bin,
   base-10-log configuration.
 - No pretrained MELLE checkpoint is distributed by this repository.

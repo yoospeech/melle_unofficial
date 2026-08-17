@@ -25,9 +25,13 @@ class MelleModelArgs:
     max_seq_len: int = 2048
     dropout: float = 0.1
     prenet_dropout: float = 0.5
+    prenet_hidden_dim: int = 256
+    latent_hidden_dim: int = 256
+    latent_dropout: float = 0.5
     postnet_channels: int = 256
     postnet_layers: int = 5
     postnet_kernel_size: int = 5
+    postnet_dropout: float = 0.5
     norm_eps: float = 1e-5
 
 
@@ -35,13 +39,14 @@ class MLP(nn.Module):
     def __init__(self, input_dim: int, hidden_dim: int, output_dim: int, dropout: float):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
+            nn.Linear(input_dim, hidden_dim, bias=False),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim, bias=False),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim, output_dim),
+            nn.Linear(hidden_dim, output_dim, bias=False),
+            nn.Dropout(dropout),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -55,13 +60,13 @@ class MelPrenet(nn.Module):
     during both training and inference.
     """
 
-    def __init__(self, mel_dim: int, model_dim: int, dropout: float):
+    def __init__(self, mel_dim: int, hidden_dim: int, model_dim: int, dropout: float):
         super().__init__()
         self.layers = nn.ModuleList(
             [
-                nn.Linear(mel_dim, model_dim),
-                nn.Linear(model_dim, model_dim),
-                nn.Linear(model_dim, model_dim),
+                nn.Linear(mel_dim, hidden_dim),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.Linear(hidden_dim, model_dim),
             ]
         )
         self.dropout = dropout
@@ -87,18 +92,45 @@ class PostNet(nn.Module):
             blocks.extend(
                 [
                     nn.Conv1d(
-                        in_channels, channels, kernel_size, padding=padding
+                        in_channels,
+                        channels,
+                        kernel_size,
+                        padding=padding,
+                        bias=False,
                     ),
+                    nn.BatchNorm1d(channels),
                     nn.Tanh(),
                     nn.Dropout(dropout),
                 ]
             )
             in_channels = channels
-        blocks.append(nn.Conv1d(in_channels, mel_dim, kernel_size, padding=padding))
+        blocks.extend(
+            [
+                nn.Conv1d(
+                    in_channels,
+                    mel_dim,
+                    kernel_size,
+                    padding=padding,
+                    bias=False,
+                ),
+                nn.BatchNorm1d(mel_dim),
+                nn.Dropout(dropout),
+            ]
+        )
         self.net = nn.Sequential(*blocks)
 
-    def forward(self, mel: torch.Tensor) -> torch.Tensor:
-        return self.net(mel.transpose(1, 2)).transpose(1, 2)
+    def forward(
+        self, mel: torch.Tensor, mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        x = mel.transpose(1, 2)
+        channel_mask = None if mask is None else mask.unsqueeze(1).to(x.dtype)
+        for module in self.net:
+            x = module(x)
+            if channel_mask is not None:
+                # Do not let activations produced at padded timesteps leak back
+                # into valid frames through a later convolution.
+                x = x * channel_mask
+        return x.transpose(1, 2)
 
 
 class MelleModel(nn.Module):
@@ -110,7 +142,13 @@ class MelleModel(nn.Module):
             raise ValueError("postnet_kernel_size must be odd")
         self.args = args
         self.text_embedding = nn.Embedding(args.text_vocab_size, args.dim)
-        self.mel_prenet = MelPrenet(args.mel_dim, args.dim, args.prenet_dropout)
+        self.mel_prenet = MelPrenet(
+            args.mel_dim,
+            args.prenet_hidden_dim,
+            args.dim,
+            args.prenet_dropout,
+        )
+        self.mel_bos_embedding = nn.Parameter(torch.empty(1, 1, args.dim))
         transformer_args = ModelArgs(
             dim=args.dim,
             n_layers=args.n_layers,
@@ -127,14 +165,19 @@ class MelleModel(nn.Module):
         )
         self.norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.latent_stats = nn.Linear(args.dim, 2 * args.mel_dim)
-        self.latent_decoder = MLP(args.mel_dim, args.dim, args.mel_dim, args.dropout)
+        self.latent_decoder = MLP(
+            args.mel_dim,
+            args.latent_hidden_dim,
+            args.mel_dim,
+            args.latent_dropout,
+        )
         self.stop_head = nn.Linear(args.dim, 1)
         self.postnet = PostNet(
             args.mel_dim,
             args.postnet_channels,
             args.postnet_layers,
             args.postnet_kernel_size,
-            args.dropout,
+            args.postnet_dropout,
         )
         freqs_cos, freqs_sin = precompute_freqs_cis(
             args.dim // args.n_heads, args.max_seq_len
@@ -142,6 +185,9 @@ class MelleModel(nn.Module):
         self.register_buffer("freqs_cos", freqs_cos, persistent=False)
         self.register_buffer("freqs_sin", freqs_sin, persistent=False)
         self.apply(self._init_weights)
+        nn.init.normal_(
+            self.mel_bos_embedding, mean=0.0, std=args.dim ** -0.5
+        )
         for name, parameter in self.named_parameters():
             if name.endswith("w3.weight") or name.endswith("wo.weight"):
                 nn.init.normal_(parameter, mean=0.0, std=0.02 / math.sqrt(2 * args.n_layers))
@@ -163,77 +209,54 @@ class MelleModel(nn.Module):
         mel_mask: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_size = text_embeddings.size(0)
-        text_lengths = text_mask.sum(dim=1)
-        mel_lengths = mel_mask.sum(dim=1)
-        total_lengths = text_lengths + mel_lengths
-        max_total = int(total_lengths.max().item())
-        if max_total > self.args.max_seq_len:
+        text_width = text_embeddings.size(1)
+        mel_width = mel_embeddings.size(1)
+        sequence_length = text_width + mel_width
+        if sequence_length > self.args.max_seq_len:
             raise ValueError(
-                f"packed sequence length {max_total} exceeds max_seq_len={self.args.max_seq_len}"
+                f"padded sequence length {sequence_length} exceeds "
+                f"max_seq_len={self.args.max_seq_len}"
             )
-        packed = text_embeddings.new_zeros(batch_size, max_total, self.args.dim)
-        # Acoustic predictions are aligned as
-        # [EOS hidden, y[0] hidden, ..., y[T-2] hidden] -> [y[0], ..., y[T-1]].
-        acoustic_positions = torch.zeros(
-            batch_size,
-            mel_embeddings.size(1) + 1,
-            dtype=torch.long,
-            device=packed.device,
-        )
-        text_rows, text_columns = text_mask.nonzero(as_tuple=True)
-        packed[text_rows, text_columns] = text_embeddings[text_rows, text_columns]
 
-        mel_rows, mel_columns = mel_mask.nonzero(as_tuple=True)
-        mel_destinations = text_lengths[mel_rows] + mel_columns
-        packed[mel_rows, mel_destinations] = mel_embeddings[mel_rows, mel_columns]
-        eos_positions = text_lengths - 1
-        acoustic_positions[:, 0] = eos_positions
-        if mel_embeddings.size(1) > 0:
-            all_mel_positions = text_lengths.unsqueeze(1) + torch.arange(
-                mel_embeddings.size(1), device=packed.device
-            ).unsqueeze(0)
-            # Padded positions are masked from every loss, but gather still
-            # requires placeholder indices to lie inside the packed tensor.
-            acoustic_positions[:, 1:] = all_mel_positions.clamp_max(max_total - 1)
-        acoustic_lengths = mel_lengths + 1
-        acoustic_mask = torch.arange(
-            mel_embeddings.size(1) + 1, device=packed.device
-        ).unsqueeze(0) < acoustic_lengths.unsqueeze(1)
-        return packed, acoustic_positions, acoustic_mask
+        packed = torch.cat([text_embeddings, mel_embeddings], dim=1)
+        # Acoustic predictions are aligned as
+        # [mel_BOS hidden, y[0] hidden, ..., y[T-2] hidden]
+        #     -> [y[0], ..., y[T-1]].
+        acoustic_positions = text_width + torch.arange(
+            mel_width, device=packed.device
+        )
+        acoustic_positions = acoustic_positions.unsqueeze(0).expand(batch_size, -1)
+        return packed, acoustic_positions, mel_mask
 
     @staticmethod
-    def _text_prefix_attention_mask(
-        text_lengths: torch.Tensor,
-        mel_lengths: torch.Tensor,
-        sequence_length: int,
-        prompt_lengths: Optional[torch.Tensor] = None,
+    def _prefix_causal_padding_attention_mask(
+        text_mask: torch.Tensor,
+        mel_mask: torch.Tensor,
     ) -> torch.Tensor:
-        """Allow bidirectional text/prompt attention and causal target attention.
+        """Build a bidirectional-text, causal-mel mask for packed sequences.
 
-        The factorization is ``p(y_t | x, y_<t)``: the complete text ``x`` is
-        visible as a fixed prefix. When prompt lengths are provided, leading
-        acoustic prompt frames are also a fixed bidirectional prefix; target
-        mel frames remain causal and can see all text, all prompt frames, and
-        previous target frames.
+        Text queries can attend the complete valid text prefix but no acoustic
+        positions. Acoustic queries can attend the complete text prefix and
+        acoustic positions up to themselves. Padding keys are never visible.
+        Padding queries receive a dummy self entry so attention never sees an
+        all-masked row; their outputs are discarded by the acoustic mask.
         """
-        if prompt_lengths is None:
-            prompt_lengths = torch.zeros_like(mel_lengths)
-        prompt_lengths = prompt_lengths.clamp(min=0)
-        prompt_lengths = torch.minimum(prompt_lengths, mel_lengths)
-        total_lengths = text_lengths + mel_lengths
-        positions = torch.arange(sequence_length, device=text_lengths.device)
-        queries = positions.view(1, sequence_length, 1)
-        keys = positions.view(1, 1, sequence_length)
-        valid_queries = queries < total_lengths.view(-1, 1, 1)
-        valid_keys = keys < total_lengths.view(-1, 1, 1)
-        prompt_prefix = (text_lengths + prompt_lengths).view(-1, 1, 1)
-        fixed_prefix = queries < prompt_prefix
-        fixed_prefix_keys = keys < prompt_prefix
-        target_queries = queries >= prompt_prefix
-        target_causal = target_queries & (keys <= queries)
-        allowed = valid_queries & valid_keys & (
-            (fixed_prefix & fixed_prefix_keys) | target_causal
-        )
+        valid = torch.cat([text_mask, mel_mask], dim=1)
+        sequence_length = valid.size(1)
+        text_width = text_mask.size(1)
+        position = torch.arange(sequence_length, device=valid.device)
+        query = position[:, None]
+        key = position[None, :]
+
+        text_prefix = (query < text_width) & (key < text_width)
+        allowed = (key <= query) | text_prefix
+        allowed = allowed & valid[:, :, None] & valid[:, None, :]
+
+        # Give discarded padding queries one finite self-attention entry.
+        padding = ~valid
+        allowed |= padding[:, :, None] & torch.eye(
+            sequence_length, dtype=torch.bool, device=position.device
+        )[None, :, :]
         return allowed.unsqueeze(1)
 
     def forward(
@@ -242,12 +265,24 @@ class MelleModel(nn.Module):
         text_mask: torch.Tensor,
         mel_inputs: torch.Tensor,
         mel_mask: torch.Tensor,
-        prompt_lengths: Optional[torch.Tensor] = None,
         sample_latent: bool = True,
         apply_postnet: bool = True,
     ) -> Dict[str, torch.Tensor]:
         text_embeddings = self.text_embedding(text_ids)
         mel_embeddings = self.mel_prenet(mel_inputs)
+        mel_bos = self.mel_bos_embedding.expand(mel_embeddings.size(0), -1, -1)
+        mel_embeddings = torch.cat(
+            [mel_bos.to(dtype=mel_embeddings.dtype), mel_embeddings], dim=1
+        )
+        mel_mask = torch.cat(
+            [
+                torch.ones(
+                    mel_mask.size(0), 1, dtype=torch.bool, device=mel_mask.device
+                ),
+                mel_mask,
+            ],
+            dim=1,
+        )
         # Autocast can leave nn.Embedding in FP32 while the mel MLP runs in
         # BF16/FP16. Packing uses indexed assignment, which requires an exact
         # dtype match between both modality embeddings.
@@ -256,11 +291,8 @@ class MelleModel(nn.Module):
             text_embeddings, text_mask, mel_embeddings, mel_mask
         )
         seq_len = hidden.size(1)
-        attention_mask = self._text_prefix_attention_mask(
-            text_mask.sum(dim=1),
-            mel_mask.sum(dim=1),
-            seq_len,
-            prompt_lengths,
+        attention_mask = self._prefix_causal_padding_attention_mask(
+            text_mask, mel_mask
         )
         for layer in self.layers:
             hidden = layer(
@@ -285,7 +317,7 @@ class MelleModel(nn.Module):
         # before the convolutional post-net so they cannot leak into the final
         # valid frames through the convolution kernel.
         coarse = coarse * acoustic_mask.unsqueeze(-1).to(coarse.dtype)
-        refined = self.refine_mel(coarse) if apply_postnet else coarse
+        refined = self.refine_mel(coarse, acoustic_mask) if apply_postnet else coarse
         refined = refined * acoustic_mask.unsqueeze(-1).to(refined.dtype)
         return {
             "coarse_mel": coarse,
@@ -295,6 +327,8 @@ class MelleModel(nn.Module):
             "stop_logits": self.stop_head(mel_hidden).squeeze(-1),
         }
 
-    def refine_mel(self, coarse: torch.Tensor) -> torch.Tensor:
+    def refine_mel(
+        self, coarse: torch.Tensor, mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         """Refine a completed coarse mel sequence with the non-causal post-net."""
-        return coarse + self.postnet(coarse)
+        return coarse + self.postnet(coarse, mask)

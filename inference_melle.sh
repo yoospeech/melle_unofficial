@@ -10,4 +10,5 @@ export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}"
 export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
 export PYTHONPATH="${SCRIPT_DIR}/vocos:${SCRIPT_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
 
-exec python3 "${SCRIPT_DIR}/inference_melle.py" "$@"
+exec /home/ysw/Documents/anaconda3/envs/vocos_3.13/bin/python \
+  "${SCRIPT_DIR}/inference_melle.py" "$@"

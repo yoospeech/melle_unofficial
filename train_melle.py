@@ -34,7 +34,7 @@ BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "16"))
 NUM_WORKERS = min(8, os.cpu_count() or 1)
 MAX_SEQ_LEN = 2048
 MAX_DURATION_SEC = 10.0
-MIN_DURATION_SEC = 6.0
+MIN_DURATION_SEC = 0.0
 VAL_RATIO = 0.001
 REDUCTION_FACTOR = 1
 DIM = 1024
@@ -118,8 +118,7 @@ if len(full_dataset) < 2:
 if master_process:
     print(
         f"Duration filter: {MIN_DURATION_SEC:.1f}s to {MAX_DURATION_SEC:.1f}s; "
-        f"training uses a fixed {mel_config.prompt_duration_sec:.1f}s acoustic prompt "
-        "and supervises the continuation"
+        "training supervises the complete teacher-forced mel sequence"
     )
 
 val_size = max(1, round(len(full_dataset) * VAL_RATIO))
@@ -180,11 +179,6 @@ model_args = MelleModelArgs(
     dropout=DROPOUT,
 )
 model = MelleModel(model_args).to(device)
-# Stage 1 trains only the autoregressive coarse-mel model.  Keep the post-net
-# in checkpoints for a separate inference-aware fine-tuning stage, but exclude
-# it from gradient tracking here.
-for parameter in model.postnet.parameters():
-    parameter.requires_grad_(False)
 optimizer_kwargs = {
     "lr": LEARNING_RATE,
     "betas": (0.9, 0.95),
@@ -227,9 +221,8 @@ def compute_losses(batch, step, sample_latent=True):
         batch["text_mask"],
         batch["mel_inputs"],
         batch["mel_input_mask"],
-        prompt_lengths=batch["prompt_steps"],
         sample_latent=sample_latent,
-        apply_postnet=False,
+        apply_postnet=True,
     )
     # Section 4.2: disable KL for the first 10K updates, then enable its full
     # weight. Spectrogram flux has no warmup and is active from step zero.
@@ -240,7 +233,6 @@ def compute_losses(batch, step, sample_latent=True):
         outputs,
         batch["mel_targets"],
         batch["mel_target_mask"],
-        batch["loss_mask"],
         batch["stop_targets"],
         kl_weight=kl_weight,
         flux_weight=FLUX_WEIGHT,
@@ -256,7 +248,10 @@ def estimate_loss(step):
     for split, iterator in (("train", train_iter), ("val", val_iter)):
         totals = {
             name: 0.0
-            for name in ("loss", "regression", "kl", "flux", "stop")
+            for name in (
+                "loss", "regression", "coarse_regression",
+                "refined_regression", "kl", "flux", "stop"
+            )
         }
         eval_progress = tqdm(
             range(EVAL_ITERS),
@@ -323,14 +318,17 @@ for iter_num in progress:
                         "iter_num": iter_num,
                         "model_args": asdict(model_args),
                         "mel_config": asdict(mel_config),
-                        "training_stage": "coarse",
+                        "training_stage": "end_to_end",
                     },
                     os.path.join(OUT_DIR, "ckpt.pt"),
                 )
 
     accumulated = {
         name: 0.0
-        for name in ("loss", "regression", "kl", "flux", "stop")
+        for name in (
+            "loss", "regression", "coarse_regression",
+            "refined_regression", "kl", "flux", "stop"
+        )
     }
     for micro_step in range(GRAD_ACCUM_STEPS):
         sync_context = (
@@ -362,6 +360,8 @@ for iter_num in progress:
         progress.set_postfix(
             loss=f"{accumulated['loss']:.4f}",
             reg=f"{accumulated['regression']:.4f}",
+            coarse=f"{accumulated['coarse_regression']:.4f}",
+            refined=f"{accumulated['refined_regression']:.4f}",
             kl=f"{accumulated['kl']:.4f}",
             flux=f"{accumulated['flux']:.4f}",
             stop=f"{accumulated['stop']:.4f}",
