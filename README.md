@@ -24,13 +24,6 @@ waveform decoding.
 > This is an independent implementation, not the authors' official code or an
 > exact reproduction. Its Vocos features differ from the paper's mel setup.
 
-## Implementation choices
-
-Key differences are **Vocos 24 kHz, 100-channel natural-log mel features**, the
-pretrained `charactr/vocos-mel-24khz` decoder, a locally trained SentencePiece
-character tokenizer, and decoder-only RoPE. Text-only and WAV-prompted
-inference are supported; autoregressive decoding currently has no KV cache.
-
 ## Overview
 
 ```text
@@ -41,15 +34,8 @@ Text ──> character tokenizer ──> prefix Transformer decoder ──> cont
 
 Text is a bidirectional prefix; mel frames are causal and begin with a learned
 `mel_BOS`. Padding and text positions are excluded from acoustic loss.
-
-## Highlights
-
-- Continuous mel autoregression without acoustic quantization
-- SentencePiece character tokenizer trained from the manifest
-- 12-layer, 1024-dimensional decoder-only Transformer with 16 attention heads
-- Variational mel prediction, convolutional post-net, and stop head
-- Regression, KL, flux, and stop objectives
-- Vocos features/decoder, BF16, DDP, TensorBoard, and checkpoint resume
+The model uses a 12-layer, 1024-dimensional decoder, SentencePiece character
+tokens, variational mel prediction, a convolutional post-net, and a stop head.
 
 ## Quick start
 
@@ -87,25 +73,14 @@ each sample:
 ]
 ```
 
-Defaults: 4–10 second clips, 24 kHz resampling, silence trimming at `top_db=40`,
+Defaults: 4–10 second clips, 24 kHz resampling, silence trimming at `top_db=30`,
 and a deterministic 0.1% validation split. Training uses full-utterance teacher
 forcing; prompt conditioning is inference-only. `speaker` is metadata only.
 
 ## Acoustic features
 
-The dataset imports `MelSpectrogramFeatures` directly from the included Vocos
-submodule.
-
-| Setting | Value |
-| --- | ---: |
-| Sample rate | 24,000 Hz |
-| FFT / window length | 1024 |
-| Hop length | 256 |
-| Mel channels | 100 |
-| Frame rate | 93.75 frames/s |
-| Spectrogram power | 1 |
-| Padding | Centered |
-| Compression | Vocos natural-log `safe_log` |
+Vocos `MelSpectrogramFeatures` uses 24 kHz audio, 100 mel channels, 1024-point
+FFT/window, 256-sample hop, centered padding, and natural-log `safe_log`.
 
 ## Training
 
@@ -129,15 +104,7 @@ The tokenizer is trained automatically if `TOKENIZER_PATH` does not exist.
 | `RESUME_CKPT` | empty | Checkpoint from which to resume |
 
 LR warms to `5e-5` over 32k steps and decays to zero by step 400k. KL weight is
-`0` for 10k steps, then `0.1`; flux weight is `0.5`. Losses are normalized by
-valid acoustic frames. Outputs are written to:
-
-```text
-runs/melle_YYYY_MM_DD_HH_MM_SS/
-├── events.out.tfevents...
-└── checkpoints/
-    └── ckpt.pt
-```
+`0` for 10k steps, then `0.1`; flux weight is `0.5`.
 
 Monitor with `tensorboard --logdir runs --bind_all`. Resume with:
 
@@ -153,6 +120,14 @@ bash train_melle.sh
 
 The trained checkpoint and its matching tokenizer are available from
 [youspeech/melle-unofficial](https://huggingface.co/youspeech/melle-unofficial):
+
+| Checkpoint | Training |
+| --- | --- |
+| `ckpt.pt` (2.3 GB) | 66,000 steps, end-to-end, about 25 h 5 min |
+
+The checkpoint records `iter_num=66000`, an 81-piece tokenizer vocabulary,
+and 24 kHz/100-mel features. The elapsed time is based on the run timestamps
+(2026-08-18 06:21–2026-08-19 07:26 KST).
 
 ```bash
 hf download youspeech/melle-unofficial \
@@ -200,10 +175,7 @@ CUDA_VISIBLE_DEVICES=0 bash inference_melle.sh \
   --seed 2
 ```
 
-Useful controls: `--min-new-seconds`, `--max-new-seconds`, `--stop-threshold`,
-`--seed`, `--skip-postnet`, and `--prompt-copy-output`.
-
-For optional `faster-whisper` scoring and best-of-N seed search, add:
+For optional `faster-whisper` scoring and seed search, add:
 
 ```bash
   --asr-reference "target text" \
@@ -211,18 +183,6 @@ For optional `faster-whisper` scoring and best-of-N seed search, add:
   --asr-model tiny.en \
   --seed 0 \
   --seed-search 5
-```
-
-## Repository layout
-
-```text
-.
-├── melle_{dataset,tokenizer,model,loss}.py
-├── train_melle.py / train_melle.sh
-├── inference_melle.py / inference_melle.sh
-├── inf_test/
-├── manifest.example.json
-└── vocos/
 ```
 
 ## Current limitations
