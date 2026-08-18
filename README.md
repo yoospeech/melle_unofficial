@@ -176,22 +176,22 @@ bash inference_melle.sh \
 
 ### Optional acoustic prompt
 
-`inf_test/` contains the prompt and tokenizer used by `inf_sh.sh`:
+`inf_test/` contains the prompt and generated sample used by `inf_sh.sh`:
 
 ```text
 inf_test/
 ├── prompt.wav
 ├── prompt.txt
-├── melle_tokenizer.model
-└── melle_tokenizer.vocab
+└── generated.wav
 ```
 
-`--text` must contain the prompt transcript followed by the continuation:
+`generated.wav` is the included 24 kHz sample output. `--text` must contain
+the prompt transcript followed by the continuation:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 bash inference_melle.sh \
   --checkpoint ./checkpoints/ckpt.pt \
-  --tokenizer ./inf_test/melle_tokenizer.model \
+  --tokenizer ./checkpoints/melle_tokenizer.model \
   --prompt-audio ./inf_test/prompt.wav \
   --text "At last the tablecloth was spread there so many genres of movies in there." \
   --output ./inf_test/generated.wav \
